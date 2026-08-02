@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>LawStudio — Sign in</title>
+<link rel="icon" type="image/png" href="/favicon.png" />
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@500;600;700;800&display=swap" rel="stylesheet" />
+<style>
+  :root { --accent:#5F4DEE; --accent-dark:#4A39C9; --ink:#17171C; --sub:#8A8E9C; --line:#E7E7EE; --bg:#F4F3F0; }
+  * { box-sizing:border-box; }
+  html,body { height:100%; margin:0; }
+  body { background:var(--bg); font-family:'Plus Jakarta Sans',system-ui,sans-serif; color:var(--ink);
+    display:grid; place-items:center; -webkit-font-smoothing:antialiased; position:relative; overflow:hidden; }
+  .sprig { position:fixed; width:220px; height:220px; opacity:.6; pointer-events:none; }
+  .sprig.tl { top:-30px; left:-30px; } .sprig.br { bottom:-30px; right:-30px; transform:rotate(180deg); }
+  .card { width:380px; max-width:92vw; background:#fff; border:1px solid #EEEEF3; border-radius:24px;
+    padding:38px 34px; box-shadow:0 18px 50px rgba(23,23,28,.08); position:relative; z-index:1; }
+  .brand { display:flex; align-items:center; gap:10px; margin-bottom:26px; }
+  .brand img { width:38px; height:38px; border-radius:10px; }
+  .brand b { font-size:16px; font-weight:800; letter-spacing:.3px; }
+  .brand span { display:block; font-size:10px; color:var(--sub); font-weight:600; }
+  h1 { font-size:22px; font-weight:800; margin:0 0 4px; }
+  .sub { font-size:12.5px; color:var(--sub); font-weight:600; margin-bottom:26px; }
+  label { font-size:10px; font-weight:800; letter-spacing:.5px; text-transform:uppercase; color:#A2A3AE; }
+  input { all:unset; box-sizing:border-box; width:100%; font-family:inherit; font-size:14px; font-weight:600;
+    color:var(--ink); padding:10px 2px; border-bottom:1.5px solid var(--line); margin:6px 0 20px; transition:border-color .15s; }
+  input:focus { border-color:var(--accent); }
+  button { all:unset; box-sizing:border-box; width:100%; text-align:center; cursor:pointer; margin-top:6px;
+    background:linear-gradient(135deg,#7B6CF6,#4A39C9); color:#fff; font-weight:800; font-size:14px;
+    padding:13px; border-radius:999px; box-shadow:0 8px 22px rgba(95,77,238,.4); transition:filter .15s; }
+  button:hover { filter:brightness(1.06); } button:disabled { opacity:.6; cursor:default; }
+  .err { color:#E14B3B; font-size:12px; font-weight:700; margin-top:12px; text-align:center; min-height:16px; }
+</style>
+</head>
+<body>
+  <svg class="sprig tl" viewBox="0 0 200 200" fill="none" stroke="#DDE0F2" stroke-width="2" stroke-linecap="round"><path d="M100 180 C100 120 100 80 100 20"/><path d="M100 150 C70 140 50 120 45 95M100 150 C130 140 150 120 155 95M100 115 C75 105 60 90 55 70M100 115 C125 105 140 90 145 70"/></svg>
+  <svg class="sprig br" viewBox="0 0 200 200" fill="none" stroke="#DDE0F2" stroke-width="2" stroke-linecap="round"><path d="M100 180 C100 120 100 80 100 20"/><path d="M100 150 C70 140 50 120 45 95M100 150 C130 140 150 120 155 95M100 115 C75 105 60 90 55 70M100 115 C125 105 140 90 145 70"/></svg>
+  <form class="card" id="f">
+    <div class="brand"><img src="/logo-64.png" alt=""/><div><b>LAWSTUDIO</b><span>Legal explainers. On autopilot.</span></div></div>
+    <h1>Welcome back</h1>
+    <div class="sub">Sign in to your studio.</div>
+    <label>Email</label>
+    <input id="email" type="email" autocomplete="username" placeholder="you@example.com" />
+    <label>Password</label>
+    <input id="password" type="password" autocomplete="current-password" placeholder="••••••••" />
+    <button id="btn" type="submit">Sign in →</button>
+    <div class="err" id="err"></div>
+  </form>
+<script>
+  const f=document.getElementById('f'), btn=document.getElementById('btn'), err=document.getElementById('err');
+  f.addEventListener('submit', async (e)=>{
+    e.preventDefault(); err.textContent=''; btn.disabled=true; btn.textContent='Signing in…';
+    try{
+      const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({email:document.getElementById('email').value.trim(),password:document.getElementById('password').value})});
+      if(r.ok){ location.href='/create'; return; }
+      const d=await r.json(); err.textContent=d.error||'Sign in failed';
+    }catch(_){ err.textContent='Network error'; }
+    btn.disabled=false; btn.textContent='Sign in →';
+  });
+</script>
+</body>
+</html>
