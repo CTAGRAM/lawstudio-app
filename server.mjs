@@ -747,6 +747,110 @@ app.post('/api/youtube/thumbnail', async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
+// ---------------------------------------------------------------- Styles
+// A style is a self-contained pack: look, beat grammar, director briefing,
+// motion, voice and render path. Adding one is data, not code — so the studio
+// can grow into any vertical without touching the pipeline, and no style shares
+// anything with another.
+app.get('/api/styles', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try { res.json(await sb('GET', 'styles?select=*&order=is_builtin.desc,name.asc') || []); }
+  catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+app.patch('/api/styles/:id', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const allow = ['name', 'tagline', 'look_prompt', 'motion_prompt', 'director_who', 'director_rules',
+                   'beat_grammar', 'voice_name', 'voice_style', 'render_mode', 'bg_options',
+                   'default_cast', 'palette', 'cover_url'];
+    const patch = {};
+    for (const k of allow) if (k in (req.body || {})) patch[k] = req.body[k];
+    patch.updated_at = new Date().toISOString();
+    const row = await sb('PATCH', `styles?id=eq.${encodeURIComponent(req.params.id)}`, patch);
+    res.json(Array.isArray(row) ? row[0] : row);
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+app.delete('/api/styles/:id', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const r = await sb('GET', `styles?id=eq.${encodeURIComponent(req.params.id)}&select=is_builtin,key`);
+    if (r && r[0] && r[0].is_builtin) return res.status(400).json({ error: 'built-in styles cannot be deleted' });
+    await sb('DELETE', `styles?id=eq.${encodeURIComponent(req.params.id)}`);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// Describe a style in plain words -> the AI writes the whole pack, then we
+// render a cover so you can see it before it's used.
+app.post('/api/styles', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const { name, brief, render_mode } = req.body || {};
+    if (!name || !brief) return res.status(400).json({ error: 'give the style a name and describe it' });
+
+    const pack = await aiJSON(
+      `You are setting up a new video style for an automated animation studio. The user describes the style; `
+      + `you write the complete configuration for it.\n\nSTYLE NAME: ${name}\nWHAT THEY WANT: ${brief}\n\n`
+      + `Write these fields:\n`
+      + `- "tagline": 3-6 words describing the look.\n`
+      + `- "look_prompt": the art-direction lock sent to the image model for EVERY scene. Describe medium, `
+      + `shapes, colour palette, line quality, shading and mood precisely. It must end with a rule forbidding `
+      + `any text, letters, numbers, logos or watermarks in the image.\n`
+      + `- "motion_prompt": how much life the animation should have (energy, expressions, camera).\n`
+      + `- "director_who": one sentence starting "You are the director of..." describing whose channel this is.\n`
+      + `- "director_rules": the content rules — subject matter to stay inside, tone, reading age, and an `
+      + `explicit instruction never to drift into unrelated subject matter.\n`
+      + `- "beat_grammar": instructions for how to structure beats. Follow this shape exactly: say how to mix `
+      + `beat kinds ('scene', 'board', 'stat'), then state that every beat has id, kind and vo (1-2 spoken `
+      + `sentences), that kind 'scene' also has "still" (a wide 16:9 visual description with a STRICT rule that `
+      + `it must describe NO text/writing/labels) and "motion", that kind 'board' also has board {title (max 4 `
+      + `words), bullets (3-5 items, max 4 words each)}, and kind 'stat' also has stat {value, label}.\n`
+      + `- "voice_name": pick ONE of Charon (warm neutral male), Kore (bright friendly female), Puck (upbeat), `
+      + `Aoede (calm female) — whichever suits.\n`
+      + `- "voice_style": a delivery instruction ending with ": " e.g. "Read in a calm, warm voice: ".\n`
+      + `- "cover_prompt": a single striking example scene in this style, for the style's thumbnail.\n`
+      + 'Return ONLY JSON with exactly those keys.', 3000);
+
+    const key = String(name).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').slice(0, 28)
+      || 'style_' + crypto.randomUUID().slice(0, 6);
+
+    // render a cover in the style's own look so it's recognisable in the picker
+    let cover_url = '';
+    const gem = process.env.GEMINI_API_KEY;
+    if (gem) {
+      try {
+        const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-image:generateContent?key=${gem}`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ contents: [{ parts: [{ text: `${pack.look_prompt}\n\nScene (wide 16:9): ${pack.cover_prompt}` }] }],
+                                 generationConfig: { responseModalities: ['IMAGE'] } }),
+        });
+        const d = await r.json();
+        const part = ((((d.candidates || [])[0] || {}).content || {}).parts || []).find((p) => p.inlineData);
+        if (part) {
+          const path = `graphic/${crypto.randomUUID()}.png`;
+          const up = await fetch(`${SB_URL}/storage/v1/object/assets/${path}`, {
+            method: 'POST',
+            headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`, 'Content-Type': 'image/png', 'x-upsert': 'true' },
+            body: Buffer.from(part.inlineData.data, 'base64'),
+          });
+          if (up.ok) cover_url = `${SB_URL}/storage/v1/object/public/assets/${path}`;
+        }
+      } catch { /* a style without a cover is still usable */ }
+    }
+
+    const row = await sb('POST', 'styles', {
+      key, name, tagline: pack.tagline || '', look_prompt: pack.look_prompt || '',
+      motion_prompt: pack.motion_prompt || '', director_who: pack.director_who || '',
+      director_rules: pack.director_rules || '', beat_grammar: pack.beat_grammar || '',
+      voice_name: pack.voice_name || 'Charon', voice_style: pack.voice_style || null,
+      render_mode: render_mode || 'image_to_video', default_cast: [], cover_url, is_builtin: false,
+    });
+    res.json(Array.isArray(row) ? row[0] : row);
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
 // ---------------------------------------------------------- Custom characters
 // A character is a name + description + ONE locked reference image. Every scene
 // that features them is generated from that image, so they stay identical
