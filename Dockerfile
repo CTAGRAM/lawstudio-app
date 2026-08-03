@@ -3,6 +3,7 @@ WORKDIR /srv
 COPY package.json ./
 RUN npm install --omit=dev
 COPY server.mjs login.html ./
+COPY public ./public
 COPY dist ./dist
 ENV PORT=8000
 EXPOSE 8000

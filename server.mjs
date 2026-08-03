@@ -568,6 +568,13 @@ app.use('/assets', express.static(path.join(DIST, 'assets')));
 app.get(['/favicon.png', '/favicon.svg', '/icons.svg', '/logo-64.png', '/logo-192.png', '/logo-512.png'],
   (req, res) => res.sendFile(path.join(DIST, req.path)));
 
+// Public (ungated) pages — required for the OAuth consent screen / verification.
+const PUBLIC = path.join(__dirname, 'public');
+app.get('/about', (_req, res) => res.sendFile(path.join(PUBLIC, 'about.html')));
+app.get('/privacy', (_req, res) => res.sendFile(path.join(PUBLIC, 'privacy.html')));
+app.get('/terms', (_req, res) => res.sendFile(path.join(PUBLIC, 'terms.html')));
+app.get('/login', (_req, res) => res.sendFile(path.join(__dirname, 'login.html')));
+
 app.get('*', (req, res) => {
   if (!authed(req)) return res.sendFile(path.join(__dirname, 'login.html'));
   res.sendFile(path.join(DIST, 'index.html'));
