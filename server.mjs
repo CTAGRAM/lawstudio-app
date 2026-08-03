@@ -458,6 +458,152 @@ app.post('/api/series/:id/approve', async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
+// ------------------------------------------------------------------ Thumbnails
+// Generate a few 16:9 thumbnail options for a video. The image model handles the
+// art; the headline is chosen by Fable 5 from the video's own topic.
+app.post('/api/thumbnails', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const { video_id, count } = req.body || {};
+    if (!video_id) return res.status(400).json({ error: 'video_id required' });
+    const gem = process.env.GEMINI_API_KEY;
+    if (!gem) return res.status(500).json({ error: 'image generation is not configured' });
+
+    const vr = await sb('GET', `videos?id=eq.${encodeURIComponent(video_id)}&select=id,title,topic,style,brand_id`);
+    const v = (vr || [])[0];
+    if (!v) return res.status(404).json({ error: 'video not found' });
+
+    let ideas = [];
+    try {
+      const out = await aiJSON(
+        `Design YouTube thumbnails for this video.\nTitle: ${v.title}\nTopic: ${v.topic || ''}\n`
+        + `Give ${count || 3} distinct concepts. Each needs a punchy 2-4 WORD headline (it will be drawn `
+        + `large on the thumbnail) and a one-sentence visual description that suits a `
+        + `${v.style === 'kids' ? 'bright playful cartoon for children' : 'clean flat-2D explainer'}.\n`
+        + 'Return ONLY JSON: {"ideas":[{"headline":"...","visual":"..."}]}', 900);
+      ideas = out.ideas || [];
+    } catch { /* fall back below */ }
+    if (!ideas.length) ideas = [{ headline: (v.title || 'Watch this').split(' ').slice(0, 3).join(' '), visual: v.topic || v.title }];
+
+    const look = v.style === 'kids'
+      ? "Bright friendly flat-2D cartoon for a children's channel, bold rounded shapes, cheerful palette"
+      : 'Clean flat-2D vector explainer illustration, warm flat colours, simple geometric shapes';
+
+    const made = [];
+    for (const idea of ideas.slice(0, count || 3)) {
+      const prompt = `YouTube thumbnail, 16:9, extremely eye-catching and readable at small size. ${look}. `
+        + `Scene: ${idea.visual}. Leave a clear area for a short headline. High contrast, bold, uncluttered. `
+        + `Do not render any text, letters or numbers in the image.`;
+      try {
+        const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-image:generateContent?key=${gem}`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseModalities: ['IMAGE'] } }),
+        });
+        const d = await r.json();
+        const part = ((((d.candidates || [])[0] || {}).content || {}).parts || []).find((p) => p.inlineData);
+        if (!part) continue;
+        const bytes = Buffer.from(part.inlineData.data, 'base64');
+        const path = `graphic/${crypto.randomUUID()}.png`;
+        const up = await fetch(`${SB_URL}/storage/v1/object/assets/${path}`, {
+          method: 'POST',
+          headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`, 'Content-Type': 'image/png', 'x-upsert': 'true' },
+          body: bytes,
+        });
+        if (!up.ok) continue;
+        const asset = await sb('POST', 'assets', {
+          kind: 'graphic', title: `Thumbnail — ${idea.headline}`, tags: ['thumbnail'],
+          style: v.style || null, brand_id: v.brand_id || null, storage_path: path,
+          mime: 'image/png', source_video: v.id, meta: { headline: idea.headline },
+        });
+        made.push({ id: (Array.isArray(asset) ? asset[0] : asset).id, headline: idea.headline,
+                    url: `${SB_URL}/storage/v1/object/public/assets/${path}` });
+      } catch { /* skip a failed option */ }
+    }
+    if (!made.length) return res.status(500).json({ error: 'no thumbnails could be generated' });
+    res.json({ thumbnails: made });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// Set a chosen thumbnail on the published YouTube video.
+app.post('/api/youtube/thumbnail', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const { video_id, channel_row_id, asset_id } = req.body || {};
+    if (!video_id || !channel_row_id || !asset_id) return res.status(400).json({ error: 'video_id, channel_row_id and asset_id required' });
+    const ytId = await videoYtId(video_id);
+    const access = await ytAccessToken(await channelWithTokens(channel_row_id));
+    const ar = await sb('GET', `assets?id=eq.${encodeURIComponent(asset_id)}&select=storage_path`);
+    const path = ar && ar[0] && ar[0].storage_path;
+    if (!path) return res.status(404).json({ error: 'thumbnail asset not found' });
+    const img = await fetch(`${SB_URL}/storage/v1/object/public/assets/${path}`);
+    const bytes = Buffer.from(await img.arrayBuffer());
+    const up = await fetch(`https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId=${ytId}`, {
+      method: 'POST', headers: { Authorization: `Bearer ${access}`, 'Content-Type': 'image/png' }, body: bytes,
+    });
+    if (!up.ok) throw new Error('thumbnail set failed: ' + (await up.text()).slice(0, 300));
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// ---------------------------------------------------------- Custom characters
+// A character is a name + description + ONE locked reference image. Every scene
+// that features them is generated from that image, so they stay identical
+// across beats, episodes and whole series.
+const STYLE_LOOK = {
+  kids: "Bright friendly flat-2D vector cartoon for a children's educational channel: clean rounded shapes, "
+      + 'thick smooth outlines, warm cheerful palette, soft simple shading.',
+  vyond: 'Flat 2D vector explainer cartoon: warm flat colours, simple geometric shapes, minimal facial features, '
+       + 'soft shadows, clean corporate-friendly look.',
+  vox: 'Editorial paper-collage cut-out character with torn paper edges and halftone texture.',
+};
+
+app.post('/api/characters', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const { name, description, style, brand_id } = req.body || {};
+    if (!name || !description) return res.status(400).json({ error: 'name and description are required' });
+    const gem = process.env.GEMINI_API_KEY;
+    if (!gem) return res.status(500).json({ error: 'image generation is not configured' });
+
+    const look = STYLE_LOOK[style] || STYLE_LOOK.vyond;
+    const prompt = `${look} Full body, facing forward, neutral friendly pose, centred on a plain solid white `
+      + `background. Character: ${description}. Consistent model-sheet style. `
+      + `Absolutely no text, letters, numbers, logos or watermarks.`;
+
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-image:generateContent?key=${gem}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseModalities: ['IMAGE'] } }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error('image error: ' + JSON.stringify(d).slice(0, 200));
+    const part = ((((d.candidates || [])[0] || {}).content || {}).parts || []).find((p) => p.inlineData);
+    if (!part) throw new Error('no image returned');
+
+    // upload the reference into the assets bucket
+    const bytes = Buffer.from(part.inlineData.data, 'base64');
+    const path = `char_ref/${crypto.randomUUID()}.png`;
+    const up = await fetch(`${SB_URL}/storage/v1/object/assets/${path}`, {
+      method: 'POST',
+      headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`, 'Content-Type': 'image/png', 'x-upsert': 'true' },
+      body: bytes,
+    });
+    if (!up.ok) throw new Error('upload failed: ' + (await up.text()).slice(0, 200));
+    const ref_url = `${SB_URL}/storage/v1/object/public/assets/${path}`;
+
+    const asset = await sb('POST', 'assets', {
+      kind: 'char_ref', title: `${name} (character)`, tags: ['character', style || 'vyond'],
+      style: style || null, brand_id: brand_id || null, storage_path: path, mime: 'image/png',
+    });
+    const key = String(name).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').slice(0, 24)
+      + '_' + crypto.randomUUID().slice(0, 4);
+    const row = await sb('POST', 'characters', {
+      key, name, description, style: style || null, brand_id: brand_id || null,
+      ref_asset: (Array.isArray(asset) ? asset[0] : asset).id, ref_url,
+    });
+    res.json(Array.isArray(row) ? row[0] : row);
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
 // -------------------------------------------------------------- Growth engine
 // Pull performance for everything we've published, let Fable 5 find what works,
 // store guidelines. plan_video reads the latest guidelines back into planning.
