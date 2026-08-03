@@ -763,7 +763,7 @@ app.patch('/api/styles/:id', async (req, res) => {
   try {
     const allow = ['name', 'tagline', 'look_prompt', 'motion_prompt', 'director_who', 'director_rules',
                    'beat_grammar', 'voice_name', 'voice_style', 'render_mode', 'bg_options',
-                   'default_cast', 'palette', 'cover_url'];
+                   'default_cast', 'palette', 'cover_url', 'lip_sync'];
     const patch = {};
     for (const k of allow) if (k in (req.body || {})) patch[k] = req.body[k];
     patch.updated_at = new Date().toISOString();
@@ -853,6 +853,49 @@ app.post('/api/styles', async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
+// Hear a voice before committing to it. Returns a short WAV rendered with the
+// exact voice + delivery instruction that will be used in production.
+const VOICES = ['Charon', 'Kore', 'Puck', 'Aoede', 'Leda', 'Fenrir', 'Orus', 'Zephyr'];
+app.post('/api/voice-preview', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const gem = process.env.GEMINI_API_KEY;
+    if (!gem) return res.status(500).json({ error: 'speech is not configured' });
+    const { voice_name, voice_style, text } = req.body || {};
+    const style = voice_style || 'Read in a calm, warm, professional British voice with a natural UK accent: ';
+    const line = text || 'Here is how this voice will sound in your videos.';
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro-preview-tts:generateContent?key=${gem}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: style + line }] }],
+        generationConfig: {
+          responseModalities: ['AUDIO'],
+          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice_name || 'Charon' } } },
+        },
+      }),
+    });
+    const d = await r.json();
+    const part = ((((d.candidates || [])[0] || {}).content || {}).parts || [])[0];
+    const inline = part && part.inlineData;
+    if (!inline) throw new Error('no audio returned');
+    // Gemini returns raw PCM — wrap it in a WAV header so a browser can play it
+    const pcm = Buffer.from(inline.data, 'base64');
+    const rate = parseInt((inline.mimeType.match(/rate=(\d+)/) || [])[1] || '24000', 10);
+    const hdr = Buffer.alloc(44);
+    hdr.write('RIFF', 0); hdr.writeUInt32LE(36 + pcm.length, 4); hdr.write('WAVE', 8);
+    hdr.write('fmt ', 12); hdr.writeUInt32LE(16, 16); hdr.writeUInt16LE(1, 20);
+    hdr.writeUInt16LE(1, 22); hdr.writeUInt32LE(rate, 24); hdr.writeUInt32LE(rate * 2, 28);
+    hdr.writeUInt16LE(2, 32); hdr.writeUInt16LE(16, 34);
+    hdr.write('data', 36); hdr.writeUInt32LE(pcm.length, 40);
+    res.set('Content-Type', 'audio/wav').send(Buffer.concat([hdr, pcm]));
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+app.get('/api/voices', (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  res.json(VOICES);
+});
+
 // ---------------------------------------------------------- Custom characters
 // A character is a name + description + ONE locked reference image. Every scene
 // that features them is generated from that image, so they stay identical
@@ -930,6 +973,7 @@ app.post('/api/characters', async (req, res) => {
     const row = await sb('POST', 'characters', {
       key, name, description: description || `${name} (from a supplied picture)`,
       style: style || null, brand_id: brand_id || null,
+      voice_name: (req.body || {}).voice_name || null, voice_style: (req.body || {}).voice_style || null,
       ref_asset: (Array.isArray(asset) ? asset[0] : asset).id, ref_url,
     });
     res.json(Array.isArray(row) ? row[0] : row);
