@@ -809,7 +809,9 @@ app.post('/api/styles', async (req, res) => {
       + `words), bullets (3-5 items, max 4 words each)}, and kind 'stat' also has stat {value, label}.\n`
       + `- "voice_name": pick ONE of Charon (warm neutral male), Kore (bright friendly female), Puck (upbeat), `
       + `Aoede (calm female) — whichever suits.\n`
-      + `- "voice_style": a delivery instruction ending with ": " e.g. "Read in a calm, warm voice: ".\n`
+      + `- "voice_style": a delivery instruction that MUST name the accent explicitly (default to a natural `
++ `British/UK English accent unless the brief asks otherwise), ending with ": " — e.g. "Read in a calm, `
++ `warm British voice with a natural UK accent: ".\n`
       + `- "cover_prompt": a single striking example scene in this style, for the style's thumbnail.\n`
       + 'Return ONLY JSON with exactly those keys.', 3000);
 
