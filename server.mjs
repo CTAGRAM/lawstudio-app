@@ -183,6 +183,142 @@ app.post('/api/youtube/publish', async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
+// --- manage + analytics: quick YouTube Data API calls done inline (no worker) ---
+
+// Refresh a channel's access token from its stored refresh_token; persist it.
+async function ytAccessToken(channel) {
+  if (!channel.refresh_token) throw new Error('channel has no refresh_token — reconnect it');
+  const r = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: GCID, client_secret: GCSECRET,
+      refresh_token: channel.refresh_token, grant_type: 'refresh_token',
+    }),
+  });
+  const t = await r.json();
+  if (!t.access_token) throw new Error('token refresh failed: ' + JSON.stringify(t).slice(0, 200));
+  try {
+    await sb('PATCH', `youtube_channels?id=eq.${channel.id}`, {
+      access_token: t.access_token,
+      token_expiry: new Date(Date.now() + (t.expires_in || 3500) * 1000).toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+  } catch { /* stale stored token is harmless */ }
+  return t.access_token;
+}
+
+async function channelWithTokens(id) {
+  const r = await sb('GET', `youtube_channels?id=eq.${encodeURIComponent(id)}`
+    + '&select=id,refresh_token,channel_id,channel_title');
+  if (!r || !r.length) throw new Error('channel not found');
+  return r[0];
+}
+
+async function videoYtId(videoId) {
+  const r = await sb('GET', `videos?id=eq.${encodeURIComponent(videoId)}&select=youtube_video_id`);
+  const yt = r && r[0] && r[0].youtube_video_id;
+  if (!yt) throw new Error('this video has not been published to YouTube');
+  return yt;
+}
+
+// Edit a published video's title / description / visibility.
+app.post('/api/youtube/update', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const { video_id, channel_row_id, title, description, privacy } = req.body || {};
+    if (!video_id || !channel_row_id) return res.status(400).json({ error: 'video_id and channel_row_id required' });
+    const ytId = await videoYtId(video_id);
+    const access = await ytAccessToken(await channelWithTokens(channel_row_id));
+
+    const cur = await (await fetch(
+      `https://www.googleapis.com/youtube/v3/videos?part=snippet,status&id=${ytId}`,
+      { headers: { Authorization: `Bearer ${access}` } })).json();
+    const item = (cur.items || [])[0];
+    if (!item) return res.status(404).json({ error: 'video not found on YouTube' });
+
+    const body = {
+      id: ytId,
+      snippet: {
+        title: title != null ? title : item.snippet.title,
+        description: description != null ? description : item.snippet.description,
+        categoryId: item.snippet.categoryId || '27',
+      },
+      status: { privacyStatus: privacy || item.status.privacyStatus },
+    };
+    const up = await fetch('https://www.googleapis.com/youtube/v3/videos?part=snippet,status', {
+      method: 'PUT', headers: { Authorization: `Bearer ${access}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!up.ok) throw new Error('update failed: ' + (await up.text()).slice(0, 300));
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// Delete a video from YouTube (user-initiated). Clears our stored link.
+app.post('/api/youtube/delete', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const { video_id, channel_row_id } = req.body || {};
+    if (!video_id || !channel_row_id) return res.status(400).json({ error: 'video_id and channel_row_id required' });
+    const ytId = await videoYtId(video_id);
+    const access = await ytAccessToken(await channelWithTokens(channel_row_id));
+    const del = await fetch(`https://www.googleapis.com/youtube/v3/videos?id=${ytId}`,
+      { method: 'DELETE', headers: { Authorization: `Bearer ${access}` } });
+    if (!del.ok && del.status !== 204) throw new Error('delete failed: ' + (await del.text()).slice(0, 300));
+    await sb('PATCH', `videos?id=eq.${encodeURIComponent(video_id)}`,
+      { youtube_video_id: null, youtube_url: null, youtube_status: 'deleted' });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// Analytics for a connected channel: channel-level stats + stats for every
+// video we published to it.
+app.get('/api/youtube/analytics', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const channel = await channelWithTokens(req.query.channel_row_id);
+    const access = await ytAccessToken(channel);
+
+    const ch = await (await fetch(
+      'https://www.googleapis.com/youtube/v3/channels?part=snippet,statistics&mine=true',
+      { headers: { Authorization: `Bearer ${access}` } })).json();
+    const cItem = (ch.items || [])[0] || {};
+    const cStats = cItem.statistics || {};
+
+    // Our published videos (any channel) — filter to this one by snippet.channelId.
+    const ours = await sb('GET', 'videos?select=id,title,youtube_video_id'
+      + '&youtube_video_id=not.is.null&order=created_at.desc&limit=50');
+    let videos = [];
+    const ids = (ours || []).map((v) => v.youtube_video_id).filter(Boolean);
+    if (ids.length) {
+      const vl = await (await fetch(
+        `https://www.googleapis.com/youtube/v3/videos?part=snippet,statistics&id=${ids.join(',')}`,
+        { headers: { Authorization: `Bearer ${access}` } })).json();
+      videos = (vl.items || [])
+        .filter((it) => it.snippet && it.snippet.channelId === channel.channel_id)
+        .map((it) => ({
+          id: it.id,
+          title: it.snippet.title,
+          publishedAt: it.snippet.publishedAt,
+          thumb: it.snippet.thumbnails && it.snippet.thumbnails.default && it.snippet.thumbnails.default.url,
+          views: Number(it.statistics.viewCount || 0),
+          likes: Number(it.statistics.likeCount || 0),
+          comments: Number(it.statistics.commentCount || 0),
+        }));
+    }
+    res.json({
+      channel: {
+        title: cItem.snippet && cItem.snippet.title,
+        thumb: cItem.snippet && cItem.snippet.thumbnails && cItem.snippet.thumbnails.default && cItem.snippet.thumbnails.default.url,
+        subscribers: Number(cStats.subscriberCount || 0),
+        views: Number(cStats.viewCount || 0),
+        videos: Number(cStats.videoCount || 0),
+      },
+      videos,
+    });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
 // static assets (js/css/img) are fine to serve; the app itself is gated at the HTML level
 app.use('/assets', express.static(path.join(DIST, 'assets')));
 app.get(['/favicon.png', '/favicon.svg', '/icons.svg', '/logo-64.png', '/logo-192.png', '/logo-512.png'],
