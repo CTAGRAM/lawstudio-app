@@ -575,7 +575,10 @@ app.get('/privacy', (_req, res) => res.sendFile(path.join(PUBLIC, 'privacy.html'
 app.get('/terms', (_req, res) => res.sendFile(path.join(PUBLIC, 'terms.html')));
 app.get('/login', (_req, res) => res.sendFile(path.join(__dirname, 'login.html')));
 
+// index.html must never be cached — it names the hashed JS bundle, so a stale
+// copy pins the browser to an old build after every deploy.
 app.get('*', (req, res) => {
+  res.set('Cache-Control', 'no-store, must-revalidate');
   if (!authed(req)) return res.sendFile(path.join(__dirname, 'login.html'));
   res.sendFile(path.join(DIST, 'index.html'));
 });
