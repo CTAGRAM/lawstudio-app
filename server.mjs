@@ -7,7 +7,7 @@ import path from 'path';
 const app = express();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DIST = path.join(__dirname, 'dist');
-app.use(express.json());
+app.use(express.json({ limit: '25mb' }));
 app.use(cookieParser());
 
 const EMAIL = process.env.LOGIN_EMAIL || '';
@@ -868,19 +868,42 @@ const STYLE_LOOK = {
 app.post('/api/characters', async (req, res) => {
   if (!authed(req)) return res.status(401).json({ error: 'unauth' });
   try {
-    const { name, description, style, brand_id } = req.body || {};
-    if (!name || !description) return res.status(400).json({ error: 'name and description are required' });
+    const { name, description, style, brand_id, image_base64, image_mime } = req.body || {};
+    if (!name) return res.status(400).json({ error: 'give the character a name' });
+    if (!description && !image_base64) {
+      return res.status(400).json({ error: 'describe the character, upload a picture, or both' });
+    }
     const gem = process.env.GEMINI_API_KEY;
     if (!gem) return res.status(500).json({ error: 'image generation is not configured' });
 
-    const look = STYLE_LOOK[style] || STYLE_LOOK.vyond;
-    const prompt = `${look} Full body, facing forward, neutral friendly pose, centred on a plain solid white `
-      + `background. Character: ${description}. Consistent model-sheet style. `
-      + `Absolutely no text, letters, numbers, logos or watermarks.`;
+    // the style's own look wins, so a character drawn from a photo still comes
+    // out on-model for the vertical it belongs to
+    let look = STYLE_LOOK[style] || STYLE_LOOK.vyond;
+    try {
+      const sr = await sb('GET', `styles?key=eq.${encodeURIComponent(style || '')}&select=look_prompt`);
+      if (sr && sr[0] && sr[0].look_prompt) look = sr[0].look_prompt;
+    } catch { /* fall back to the generic look */ }
+
+    const parts = [];
+    let prompt;
+    if (image_base64) {
+      // redraw whatever they uploaded into this style, keeping the likeness
+      parts.push({ inline_data: { mime_type: image_mime || 'image/png', data: image_base64 } });
+      prompt = `${look}\n\nRedraw the character in the supplied picture in EXACTLY this art style. `
+        + `Keep them clearly recognisable — same hair, face shape, skin tone, clothing and colours`
+        + (description ? `. Additional direction: ${description}` : '')
+        + `. Full body, facing forward, neutral friendly pose, centred on a plain solid white background, `
+        + `model-sheet style. Absolutely no text, letters, numbers, logos or watermarks.`;
+    } else {
+      prompt = `${look}\n\nFull body, facing forward, neutral friendly pose, centred on a plain solid white `
+        + `background. Character: ${description}. Consistent model-sheet style. `
+        + `Absolutely no text, letters, numbers, logos or watermarks.`;
+    }
+    parts.push({ text: prompt });
 
     const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-image:generateContent?key=${gem}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseModalities: ['IMAGE'] } }),
+      body: JSON.stringify({ contents: [{ parts }], generationConfig: { responseModalities: ['IMAGE'] } }),
     });
     const d = await r.json();
     if (!r.ok) throw new Error('image error: ' + JSON.stringify(d).slice(0, 200));
@@ -905,7 +928,8 @@ app.post('/api/characters', async (req, res) => {
     const key = String(name).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').slice(0, 24)
       + '_' + crypto.randomUUID().slice(0, 4);
     const row = await sb('POST', 'characters', {
-      key, name, description, style: style || null, brand_id: brand_id || null,
+      key, name, description: description || `${name} (from a supplied picture)`,
+      style: style || null, brand_id: brand_id || null,
       ref_asset: (Array.isArray(asset) ? asset[0] : asset).id, ref_url,
     });
     res.json(Array.isArray(row) ? row[0] : row);
