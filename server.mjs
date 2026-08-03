@@ -375,7 +375,7 @@ async function aiJSON(prompt, maxTokens = 1500) {
 app.post('/api/series', async (req, res) => {
   if (!authed(req)) return res.status(401).json({ error: 'unauth' });
   try {
-    const { brand_id, topic, style, episode_count } = req.body || {};
+    const { brand_id, topic, style, episode_count, cast_keys } = req.body || {};
     if (!topic) return res.status(400).json({ error: 'topic required' });
     let brandName = '';
     if (brand_id) {
@@ -385,6 +385,7 @@ app.post('/api/series', async (req, res) => {
     const srow = (await sb('POST', 'series', {
       brand_id: brand_id || null, topic, style: style || 'vyond',
       episode_count: episode_count || null, status: 'planning',
+      cast_keys: Array.isArray(cast_keys) ? cast_keys : [],
     }))[0];
 
     const n = episode_count ? `exactly ${episode_count}` : 'the right number (4-6)';
@@ -440,14 +441,19 @@ app.post('/api/series/:id/approve', async (req, res) => {
 
     for (let i = 0; i < episodes.length; i++) {
       const ep = episodes[i];
+      // a series keeps one fixed cast so the characters never drift between episodes
+      const cast = Array.isArray(s.cast_keys) ? s.cast_keys : [];
       const v = (await sb('POST', 'videos', {
         title: ep.title || `Episode ${i + 1}`, topic: ep.angle || ep.title || s.topic,
         style: s.style || 'vyond', brand_id: s.brand_id || null,
         series_id: s.id, episode_idx: i, status: 'queued',
+        progress: cast.length ? { cast_keys: cast } : {},
       }))[0];
       await sb('POST', 'jobs', {
         type: 'plan', video_id: v.id,
-        payload: { style: s.style || 'vyond', topic: ep.angle || ep.title || s.topic, brand_id: s.brand_id || null, series_id: s.id },
+        payload: { style: s.style || 'vyond', topic: ep.angle || ep.title || s.topic,
+                   brand_id: s.brand_id || null, series_id: s.id,
+                   cast_keys: cast.length ? cast : undefined },
       });
     }
     const updated = (await sb('PATCH', `series?id=eq.${s.id}`, {
@@ -474,13 +480,18 @@ const ytGet = async (path, access) => {
   return d;
 };
 
-// Rough monthly-revenue estimate. YouTube never exposes another channel's real
-// earnings — this is views x an RPM band, the same inference Social Blade makes.
+// Revenue estimates. YouTube never exposes another channel's real earnings —
+// this is views x an RPM band, the same inference Social Blade makes.
 const RPM_BAND = { legal: [8, 25], finance: [10, 30], education: [3, 9], kids: [1, 4], default: [2, 7] };
 function revenueEstimate(views, category = 'default') {
   const [lo, hi] = RPM_BAND[category] || RPM_BAND.default;
   const monetisable = views * 0.55;          // not every view is monetised
   return { low: Math.round((monetisable / 1000) * lo), high: Math.round((monetisable / 1000) * hi) };
+}
+// Karim wants "best revenue videos per month" — so rank on what a video is
+// earning NOW (recent daily views x 30), not what it earned over its lifetime.
+function monthlyEstimate(viewsPerDay, category = 'default') {
+  return revenueEstimate(viewsPerDay * 30, category);
 }
 
 // Add a competitor by channel URL, @handle or channel id.
@@ -560,9 +571,11 @@ app.get('/api/competitors/:id/videos', async (req, res) => {
         id: it.id, title: it.snippet.title, publishedAt: it.snippet.publishedAt,
         thumb: it.snippet.thumbnails?.medium?.url,
         views, likes: Number(it.statistics.likeCount || 0), comments: Number(it.statistics.commentCount || 0),
-        perDay: Math.round(views / days), revenue: revenueEstimate(views, cat),
+        perDay: Math.round(views / days),
+        revenue: revenueEstimate(views, cat),                       // lifetime
+        monthly: monthlyEstimate(Math.round(views / days), cat),    // earning right now
       };
-    }).sort((a, b) => b.views - a.views);
+    }).sort((a, b) => b.monthly.high - a.monthly.high);             // best earners first
     res.json({ competitor: c, videos, revenue_note: 'Estimated from views x typical RPM — YouTube does not publish other channels’ real revenue.' });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
