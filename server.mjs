@@ -351,8 +351,114 @@ app.get('/api/youtube/analytics-timeseries', async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
-// AI-suggest YouTube metadata (title/description/tags) from a video's topic+script.
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || '';
+
+// Small helper: ask Fable 5 for a JSON object and parse it.
+async function aiJSON(prompt, maxTokens = 1500) {
+  if (!ANTHROPIC_KEY) throw new Error('AI not configured');
+  const ar = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'claude-fable-5', max_tokens: maxTokens, messages: [{ role: 'user', content: prompt }] }),
+  });
+  const data = await ar.json();
+  if (!ar.ok) throw new Error('AI error: ' + JSON.stringify(data).slice(0, 200));
+  const text = (data.content || []).map((c) => c.text || '').join('');
+  const m = text.match(/\{[\s\S]*\}/);
+  if (!m) throw new Error('AI returned no JSON');
+  return JSON.parse(m[0]);
+}
+
+// -------------------------------------------------------------- Series engine
+// One brief -> AI plans a season -> user approves -> each episode becomes a
+// normal video (a 'plan' job), reusing the whole per-video pipeline.
+app.post('/api/series', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const { brand_id, topic, style, episode_count } = req.body || {};
+    if (!topic) return res.status(400).json({ error: 'topic required' });
+    let brandName = '';
+    if (brand_id) {
+      const b = await sb('GET', `brands?id=eq.${encodeURIComponent(brand_id)}&select=name`);
+      brandName = (b && b[0] && b[0].name) || '';
+    }
+    const srow = (await sb('POST', 'series', {
+      brand_id: brand_id || null, topic, style: style || 'vyond',
+      episode_count: episode_count || null, status: 'planning',
+    }))[0];
+
+    const n = episode_count ? `exactly ${episode_count}` : 'the right number (4-6)';
+    const plan = await aiJSON(
+      `You are the showrunner for a UK legal-explainer video channel${brandName ? ` (brand: ${brandName})` : ''}.
+Plan a coherent mini-series (a "season") of ${n} short standalone explainer episodes on the theme: "${topic}".
+Order them as a real learning arc (foundations -> specifics -> edge cases/advanced). Accurate UK law, no invented stats.
+Return ONLY JSON: {"season_title": "...", "episodes": [ {"title": "<=70 chars", "angle": "one sentence describing exactly what this episode explains — this becomes the video brief", "synopsis": "one viewer-facing sentence"} ]}`,
+      2500);
+
+    const updated = (await sb('PATCH', `series?id=eq.${srow.id}`, {
+      status: 'plan_review', plan,
+      title: plan.season_title || topic,
+      episode_count: (plan.episodes || []).length,
+      updated_at: new Date().toISOString(),
+    }))[0];
+    res.json(updated);
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+app.get('/api/series', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    res.json(await sb('GET', 'series?select=*&order=created_at.desc') || []);
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+app.get('/api/series/:id', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const s = (await sb('GET', `series?id=eq.${encodeURIComponent(req.params.id)}&select=*`))[0];
+    if (!s) return res.status(404).json({ error: 'not found' });
+    const episodes = await sb('GET', `videos?series_id=eq.${encodeURIComponent(req.params.id)}`
+      + '&select=id,title,status,episode_idx,youtube_status,youtube_url&order=episode_idx.asc');
+    res.json({ series: s, episodes: episodes || [] });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+app.delete('/api/series/:id', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try { await sb('DELETE', `series?id=eq.${encodeURIComponent(req.params.id)}`); res.json({ ok: true }); }
+  catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// Approve a season plan -> create one video (+ plan job) per episode.
+app.post('/api/series/:id/approve', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const s = (await sb('GET', `series?id=eq.${encodeURIComponent(req.params.id)}&select=*`))[0];
+    if (!s) return res.status(404).json({ error: 'not found' });
+    const episodes = (req.body && req.body.episodes) || (s.plan && s.plan.episodes) || [];
+    if (!episodes.length) return res.status(400).json({ error: 'no episodes to create' });
+
+    for (let i = 0; i < episodes.length; i++) {
+      const ep = episodes[i];
+      const v = (await sb('POST', 'videos', {
+        title: ep.title || `Episode ${i + 1}`, topic: ep.angle || ep.title || s.topic,
+        style: s.style || 'vyond', brand_id: s.brand_id || null,
+        series_id: s.id, episode_idx: i, status: 'queued',
+      }))[0];
+      await sb('POST', 'jobs', {
+        type: 'plan', video_id: v.id,
+        payload: { style: s.style || 'vyond', topic: ep.angle || ep.title || s.topic, brand_id: s.brand_id || null, series_id: s.id },
+      });
+    }
+    const updated = (await sb('PATCH', `series?id=eq.${s.id}`, {
+      status: 'generating', plan: { ...(s.plan || {}), episodes },
+      episode_count: episodes.length, updated_at: new Date().toISOString(),
+    }))[0];
+    res.json(updated);
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// AI-suggest YouTube metadata (title/description/tags) from a video's topic+script.
 app.get('/api/youtube/suggest-meta', async (req, res) => {
   if (!authed(req)) return res.status(401).json({ error: 'unauth' });
   try {
