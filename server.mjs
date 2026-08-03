@@ -458,6 +458,195 @@ app.post('/api/series/:id/approve', async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
+// ----------------------------------------------------------------- Research
+// Competitor tracking, trending topics and "steal the structure of this video".
+// Public reads go through a connected channel's OAuth token (no extra API key).
+
+async function ytToken() {
+  const rows = await sb('GET', 'youtube_channels?select=id,refresh_token,channel_id&limit=1');
+  if (!rows || !rows.length) throw new Error('connect a YouTube channel first — research uses its API access');
+  return ytAccessToken(rows[0]);
+}
+const ytGet = async (path, access) => {
+  const r = await fetch(`https://www.googleapis.com/youtube/v3/${path}`, { headers: { Authorization: `Bearer ${access}` } });
+  const d = await r.json();
+  if (!r.ok) throw new Error('youtube: ' + JSON.stringify(d).slice(0, 200));
+  return d;
+};
+
+// Rough monthly-revenue estimate. YouTube never exposes another channel's real
+// earnings — this is views x an RPM band, the same inference Social Blade makes.
+const RPM_BAND = { legal: [8, 25], finance: [10, 30], education: [3, 9], kids: [1, 4], default: [2, 7] };
+function revenueEstimate(views, category = 'default') {
+  const [lo, hi] = RPM_BAND[category] || RPM_BAND.default;
+  const monetisable = views * 0.55;          // not every view is monetised
+  return { low: Math.round((monetisable / 1000) * lo), high: Math.round((monetisable / 1000) * hi) };
+}
+
+// Add a competitor by channel URL, @handle or channel id.
+app.post('/api/competitors', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const { input, brand_id } = req.body || {};
+    if (!input) return res.status(400).json({ error: 'paste a channel URL or @handle' });
+    const access = await ytToken();
+    const raw = String(input).trim();
+
+    let channelId = null;
+    const idM = raw.match(/channel\/(UC[\w-]{20,})/) || raw.match(/^(UC[\w-]{20,})$/);
+    if (idM) channelId = idM[1];
+    if (!channelId) {
+      const handle = (raw.match(/@([\w.-]+)/) || [])[1];
+      if (handle) {
+        const d = await ytGet(`channels?part=snippet,statistics&forHandle=@${encodeURIComponent(handle)}`, access);
+        if ((d.items || []).length) channelId = d.items[0].id;
+      }
+    }
+    if (!channelId) { // last resort: search by name
+      const d = await ytGet(`search?part=snippet&type=channel&maxResults=1&q=${encodeURIComponent(raw)}`, access);
+      channelId = (((d.items || [])[0] || {}).snippet || {}).channelId || (((d.items || [])[0] || {}).id || {}).channelId;
+    }
+    if (!channelId) return res.status(404).json({ error: 'could not find that channel' });
+
+    const ch = await ytGet(`channels?part=snippet,statistics&id=${channelId}`, access);
+    const item = (ch.items || [])[0];
+    if (!item) return res.status(404).json({ error: 'channel not found' });
+    const row = {
+      channel_id: channelId, title: item.snippet.title,
+      handle: item.snippet.customUrl || null,
+      thumb: item.snippet.thumbnails?.default?.url || null,
+      subscribers: Number(item.statistics.subscriberCount || 0),
+      views: Number(item.statistics.viewCount || 0),
+      video_count: Number(item.statistics.videoCount || 0),
+      brand_id: brand_id || null, updated_at: new Date().toISOString(),
+    };
+    const existing = await sb('GET', `competitors?channel_id=eq.${encodeURIComponent(channelId)}&select=id`);
+    const saved = existing && existing.length
+      ? await sb('PATCH', `competitors?id=eq.${existing[0].id}`, row)
+      : await sb('POST', 'competitors', row);
+    res.json(Array.isArray(saved) ? saved[0] : saved);
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+app.get('/api/competitors', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try { res.json(await sb('GET', 'competitors?select=*&order=subscribers.desc') || []); }
+  catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+app.delete('/api/competitors/:id', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try { await sb('DELETE', `competitors?id=eq.${encodeURIComponent(req.params.id)}`); res.json({ ok: true }); }
+  catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// A competitor's recent uploads, ranked, with view velocity and revenue estimate.
+app.get('/api/competitors/:id/videos', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const rows = await sb('GET', `competitors?id=eq.${encodeURIComponent(req.params.id)}&select=*`);
+    const c = (rows || [])[0];
+    if (!c) return res.status(404).json({ error: 'competitor not found' });
+    const access = await ytToken();
+    const s = await ytGet(`search?part=snippet&type=video&order=date&maxResults=25&channelId=${c.channel_id}`, access);
+    const ids = (s.items || []).map((i) => i.id.videoId).filter(Boolean);
+    if (!ids.length) return res.json({ competitor: c, videos: [] });
+    const v = await ytGet(`videos?part=snippet,statistics,contentDetails&id=${ids.join(',')}`, access);
+    const cat = (req.query.category || 'default');
+    const videos = (v.items || []).map((it) => {
+      const views = Number(it.statistics.viewCount || 0);
+      const days = Math.max(1, (Date.now() - new Date(it.snippet.publishedAt).getTime()) / 864e5);
+      return {
+        id: it.id, title: it.snippet.title, publishedAt: it.snippet.publishedAt,
+        thumb: it.snippet.thumbnails?.medium?.url,
+        views, likes: Number(it.statistics.likeCount || 0), comments: Number(it.statistics.commentCount || 0),
+        perDay: Math.round(views / days), revenue: revenueEstimate(views, cat),
+      };
+    }).sort((a, b) => b.views - a.views);
+    res.json({ competitor: c, videos, revenue_note: 'Estimated from views x typical RPM — YouTube does not publish other channels’ real revenue.' });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// Trending / outrank research: what's performing for a keyword right now.
+app.get('/api/research/trending', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const q = String(req.query.q || '').trim();
+    if (!q) return res.status(400).json({ error: 'give a topic or keyword' });
+    const access = await ytToken();
+    const s = await ytGet(`search?part=snippet&type=video&order=viewCount&maxResults=20&publishedAfter=`
+      + `${new Date(Date.now() - 180 * 864e5).toISOString()}&q=${encodeURIComponent(q)}`, access);
+    const ids = (s.items || []).map((i) => i.id.videoId).filter(Boolean);
+    let videos = [];
+    if (ids.length) {
+      const v = await ytGet(`videos?part=snippet,statistics&id=${ids.join(',')}`, access);
+      videos = (v.items || []).map((it) => {
+        const views = Number(it.statistics.viewCount || 0);
+        const days = Math.max(1, (Date.now() - new Date(it.snippet.publishedAt).getTime()) / 864e5);
+        return { id: it.id, title: it.snippet.title, channel: it.snippet.channelTitle,
+                 publishedAt: it.snippet.publishedAt, thumb: it.snippet.thumbnails?.medium?.url,
+                 views, perDay: Math.round(views / days) };
+      }).sort((a, b) => b.perDay - a.perDay);
+    }
+    // let the AI turn what's winning into angles we could actually outrank
+    let angles = [];
+    try {
+      const out = await aiJSON(
+        `These YouTube videos are currently performing for "${q}":\n`
+        + videos.slice(0, 12).map((v) => `- ${v.title} (${v.views} views, ${v.perDay}/day)`).join('\n')
+        + `\n\nPropose 5 video angles we could make that would compete with or beat these — `
+        + `find the gaps and the under-served questions, don't just copy the titles.\n`
+        + 'Return ONLY JSON: {"angles":[{"title":"a strong YouTube title","why":"one line on why this can win"}]}', 1100);
+      angles = out.angles || [];
+    } catch { /* research still useful without angles */ }
+    res.json({ videos, angles });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// Paste a competitor video link -> pull what we can and reverse-engineer a brief.
+app.post('/api/research/extract', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const { url } = req.body || {};
+    const vid = String(url || '').match(/(?:v=|youtu\.be\/|shorts\/|embed\/)([\w-]{11})/);
+    if (!vid) return res.status(400).json({ error: 'paste a YouTube video link' });
+    const access = await ytToken();
+    const d = await ytGet(`videos?part=snippet,contentDetails,statistics&id=${vid[1]}`, access);
+    const it = (d.items || [])[0];
+    if (!it) return res.status(404).json({ error: 'video not found' });
+
+    // captions are only downloadable by the owner, so try the public timedtext
+    // endpoint and fall back to title/description if it isn't available
+    let transcript = '';
+    try {
+      const t = await fetch(`https://www.youtube.com/api/timedtext?v=${vid[1]}&lang=en&fmt=json3`);
+      if (t.ok) {
+        const j = await t.json();
+        transcript = (j.events || []).flatMap((e) => (e.segs || []).map((s) => s.utf8)).join(' ')
+          .replace(/\s+/g, ' ').trim();
+      }
+    } catch { /* optional */ }
+
+    const source = transcript
+      ? `TRANSCRIPT:\n${transcript.slice(0, 6000)}`
+      : `TITLE: ${it.snippet.title}\nDESCRIPTION: ${(it.snippet.description || '').slice(0, 2000)}`;
+
+    const out = await aiJSON(
+      `Reverse-engineer the structure of this YouTube video so we can make our own, better version `
+      + `on the same subject. Do NOT copy its wording — describe the structure and write original angles.\n\n${source}\n\n`
+      + 'Return ONLY JSON: {"topic":"one-sentence brief we could feed a video generator",'
+      + '"structure":[{"beat":"what this section does","note":"why it works"}],'
+      + '"hooks":["3 alternative opening lines, original wording"],'
+      + '"our_angle":"how our version should differ to be more useful"}', 1800);
+
+    res.json({
+      video: { id: it.id, title: it.snippet.title, channel: it.snippet.channelTitle,
+               views: Number(it.statistics.viewCount || 0), thumb: it.snippet.thumbnails?.medium?.url },
+      had_transcript: !!transcript, ...out,
+    });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
 // ------------------------------------------------------------------ Thumbnails
 // Generate a few 16:9 thumbnail options for a video. The image model handles the
 // art; the headline is chosen by Fable 5 from the video's own topic.
