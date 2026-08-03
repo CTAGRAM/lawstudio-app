@@ -458,6 +458,73 @@ app.post('/api/series/:id/approve', async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
+// -------------------------------------------------------------- Growth engine
+// Pull performance for everything we've published, let Fable 5 find what works,
+// store guidelines. plan_video reads the latest guidelines back into planning.
+app.post('/api/growth/analyze', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const channels = await sb('GET', 'youtube_channels?select=id,refresh_token,channel_id');
+    const ours = await sb('GET', 'videos?select=id,title,topic,youtube_video_id'
+      + '&youtube_video_id=not.is.null&order=created_at.desc&limit=50');
+    const idToMeta = {}; (ours || []).forEach((v) => { idToMeta[v.youtube_video_id] = v; });
+    const perf = [];
+    for (const ch of channels || []) {
+      const ids = (ours || []).map((v) => v.youtube_video_id).filter(Boolean);
+      if (!ids.length) continue;
+      let access;
+      try { access = await ytAccessToken(ch); } catch { continue; }
+      const vl = await (await fetch(
+        `https://www.googleapis.com/youtube/v3/videos?part=snippet,statistics&id=${ids.join(',')}`,
+        { headers: { Authorization: `Bearer ${access}` } })).json();
+      (vl.items || []).forEach((it) => {
+        if (it.snippet && it.snippet.channelId === ch.channel_id) {
+          perf.push({
+            title: it.snippet.title,
+            topic: (idToMeta[it.id] || {}).topic || '',
+            views: Number(it.statistics.viewCount || 0),
+            likes: Number(it.statistics.likeCount || 0),
+            comments: Number(it.statistics.commentCount || 0),
+          });
+        }
+      });
+    }
+    if (!perf.length) return res.status(400).json({ error: 'No published videos with stats yet — publish a few first.' });
+
+    perf.sort((a, b) => b.views - a.views);
+    const out = await aiJSON(
+      `You are the growth strategist for a UK legal-explainer YouTube operation. Here is the performance of our
+published videos (JSON): ${JSON.stringify(perf.slice(0, 40))}.
+Identify what actually drives views and engagement — topic themes, title patterns, length/format — and give concrete,
+actionable guidance for the NEXT videos. Be specific to this data, not generic.
+Return ONLY JSON: {"insight": "2-3 sentence summary of what's working", "guidelines": ["5-8 short imperative rules for future videos"]}`,
+      1500);
+    const row = (await sb('POST', 'growth', {
+      insight: out.insight || '', guidelines: out.guidelines || [], top: perf.slice(0, 5),
+    }))[0];
+    res.json(row);
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+app.get('/api/growth', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const rows = await sb('GET', 'growth?select=*&order=created_at.desc&limit=1');
+    res.json((rows && rows[0]) || null);
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// Auto-cut vertical Shorts from a finished video (worker does the rendering).
+app.post('/api/shorts', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const { video_id } = req.body || {};
+    if (!video_id) return res.status(400).json({ error: 'video_id required' });
+    const job = await sb('POST', 'jobs', { type: 'snippets', video_id, payload: { video_id } });
+    res.json({ ok: true, job: Array.isArray(job) ? job[0] : job });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
 // AI-suggest YouTube metadata (title/description/tags) from a video's topic+script.
 app.get('/api/youtube/suggest-meta', async (req, res) => {
   if (!authed(req)) return res.status(401).json({ error: 'unauth' });
