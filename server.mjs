@@ -26,6 +26,163 @@ app.post('/api/login', (req, res) => {
 });
 app.post('/api/logout', (_req, res) => { res.clearCookie('ls_auth'); res.json({ ok: true }); });
 
+// ---------------------------------------------------------------------------
+// YouTube integration (OAuth connect + publish enqueue).
+// Refresh tokens live in Supabase (youtube_channels, RLS-locked to the secret
+// key). The browser never touches that table — it goes through these routes.
+// ---------------------------------------------------------------------------
+const GCID = process.env.GOOGLE_CLIENT_ID || '';
+const GCSECRET = process.env.GOOGLE_CLIENT_SECRET || '';
+const REDIRECT = process.env.YOUTUBE_REDIRECT_URI
+  || 'https://lawstudio-app-goodfor-2789d27c.koyeb.app/api/youtube/callback';
+const SB_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
+const SB_KEY = process.env.SUPABASE_SECRET || '';
+const SCOPES = [
+  'https://www.googleapis.com/auth/youtube.upload',
+  'https://www.googleapis.com/auth/youtube.readonly',
+  'https://www.googleapis.com/auth/userinfo.email',
+].join(' ');
+
+async function sb(method, pathq, body) {
+  const r = await fetch(`${SB_URL}/rest/v1/${pathq}`, {
+    method,
+    headers: {
+      apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`,
+      'Content-Type': 'application/json', Prefer: 'return=representation',
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!r.ok) throw new Error(`supabase ${method} ${pathq}: ${r.status} ${await r.text()}`);
+  const t = await r.text();
+  return t ? JSON.parse(t) : null;
+}
+
+// signed state carries the brand/label through the OAuth round-trip (CSRF guard)
+const signState = (obj) => {
+  const p = Buffer.from(JSON.stringify(obj)).toString('base64url');
+  const sig = crypto.createHmac('sha256', SECRET).update(p).digest('base64url');
+  return `${p}.${sig}`;
+};
+const readState = (s) => {
+  const [p, sig] = String(s || '').split('.');
+  if (!p || !sig) return null;
+  const exp = crypto.createHmac('sha256', SECRET).update(p).digest('base64url');
+  if (exp !== sig) return null;
+  try { return JSON.parse(Buffer.from(p, 'base64url').toString()); } catch { return null; }
+};
+
+// Step 1: send the user to Google's consent screen.
+app.get('/api/youtube/connect', (req, res) => {
+  if (!authed(req)) return res.redirect('/');
+  if (!GCID) return res.status(500).send('YouTube is not configured (missing GOOGLE_CLIENT_ID).');
+  const state = signState({ b: req.query.brand || '', l: req.query.label || '', t: Date.now() });
+  const p = new URLSearchParams({
+    client_id: GCID, redirect_uri: REDIRECT, response_type: 'code', scope: SCOPES,
+    access_type: 'offline', prompt: 'consent', include_granted_scopes: 'true', state,
+  });
+  res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${p}`);
+});
+
+// Step 2: Google redirects back with a code — exchange it, store the channel.
+app.get('/api/youtube/callback', async (req, res) => {
+  try {
+    const { code, state, error } = req.query;
+    if (error) return res.redirect('/youtube?err=' + encodeURIComponent(error));
+    const st = readState(state);
+    if (!code || !st) return res.redirect('/youtube?err=badstate');
+
+    const tokRes = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code, client_id: GCID, client_secret: GCSECRET,
+        redirect_uri: REDIRECT, grant_type: 'authorization_code',
+      }),
+    });
+    const tok = await tokRes.json();
+    if (!tok.access_token) return res.redirect('/youtube?err=notoken');
+
+    const chRes = await fetch(
+      'https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true',
+      { headers: { Authorization: `Bearer ${tok.access_token}` } });
+    const ch = await chRes.json();
+    const item = (ch.items || [])[0];
+    if (!item) return res.redirect('/youtube?err=nochannel');
+
+    let email = '';
+    try {
+      const ui = await (await fetch('https://www.googleapis.com/oauth2/v2/userinfo',
+        { headers: { Authorization: `Bearer ${tok.access_token}` } })).json();
+      email = ui.email || '';
+    } catch { /* email is best-effort */ }
+
+    const row = {
+      brand_slug: st.b || null,
+      label: st.l || (item.snippet && item.snippet.title) || 'YouTube channel',
+      channel_id: item.id,
+      channel_title: item.snippet && item.snippet.title,
+      channel_thumb: item.snippet && item.snippet.thumbnails
+        && item.snippet.thumbnails.default && item.snippet.thumbnails.default.url,
+      google_email: email,
+      access_token: tok.access_token,
+      refresh_token: tok.refresh_token || null,
+      token_expiry: new Date(Date.now() + (tok.expires_in || 3500) * 1000).toISOString(),
+      scopes: tok.scope || SCOPES,
+      updated_at: new Date().toISOString(),
+    };
+
+    const existing = await sb('GET',
+      `youtube_channels?channel_id=eq.${encodeURIComponent(item.id)}&select=id`);
+    if (existing && existing.length) {
+      // keep the stored refresh_token if Google didn't hand back a new one
+      if (!row.refresh_token) delete row.refresh_token;
+      await sb('PATCH', `youtube_channels?id=eq.${existing[0].id}`, row);
+    } else {
+      await sb('POST', 'youtube_channels', row);
+    }
+    res.redirect('/youtube?ok=1');
+  } catch (e) {
+    res.redirect('/youtube?err=' + encodeURIComponent(String(e.message || e)));
+  }
+});
+
+// List connected channels — non-sensitive fields only (no tokens ever leave the server).
+app.get('/api/youtube/channels', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const rows = await sb('GET', 'youtube_channels?select=id,brand_slug,label,'
+      + 'channel_id,channel_title,channel_thumb,google_email,created_at&order=created_at.desc');
+    res.json(rows || []);
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+app.delete('/api/youtube/channels/:id', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    await sb('DELETE', `youtube_channels?id=eq.${encodeURIComponent(req.params.id)}`);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// Enqueue a publish job — the Python worker does the actual upload.
+app.post('/api/youtube/publish', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const { video_id, channel_row_id, title, description, tags, privacy } = req.body || {};
+    if (!video_id || !channel_row_id) {
+      return res.status(400).json({ error: 'video_id and channel_row_id required' });
+    }
+    const job = await sb('POST', 'jobs', {
+      type: 'youtube_publish', video_id,
+      payload: {
+        channel_row_id, title: title || null, description: description || null,
+        tags: tags || [], privacy: privacy || 'private',
+      },
+    });
+    await sb('PATCH', `videos?id=eq.${encodeURIComponent(video_id)}`, { youtube_status: 'queued' });
+    res.json({ ok: true, job: Array.isArray(job) ? job[0] : job });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
 // static assets (js/css/img) are fine to serve; the app itself is gated at the HTML level
 app.use('/assets', express.static(path.join(DIST, 'assets')));
 app.get(['/favicon.png', '/favicon.svg', '/icons.svg', '/logo-64.png', '/logo-192.png', '/logo-512.png'],
