@@ -225,7 +225,7 @@ async function videoYtId(videoId) {
 app.post('/api/youtube/update', async (req, res) => {
   if (!authed(req)) return res.status(401).json({ error: 'unauth' });
   try {
-    const { video_id, channel_row_id, title, description, privacy } = req.body || {};
+    const { video_id, channel_row_id, title, description, privacy, tags } = req.body || {};
     if (!video_id || !channel_row_id) return res.status(400).json({ error: 'video_id and channel_row_id required' });
     const ytId = await videoYtId(video_id);
     const access = await ytAccessToken(await channelWithTokens(channel_row_id));
@@ -242,6 +242,7 @@ app.post('/api/youtube/update', async (req, res) => {
         title: title != null ? title : item.snippet.title,
         description: description != null ? description : item.snippet.description,
         categoryId: item.snippet.categoryId || '27',
+        tags: (Array.isArray(tags) && tags.length) ? tags : item.snippet.tags,
       },
       status: { privacyStatus: privacy || item.status.privacyStatus },
     };
@@ -315,6 +316,76 @@ app.get('/api/youtube/analytics', async (req, res) => {
         videos: Number(cStats.videoCount || 0),
       },
       videos,
+    });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// Time-series analytics (views / watch-time / retention) via the YouTube
+// Analytics API. Needs the yt-analytics.readonly scope — if the stored token
+// predates it, we tell the UI to prompt a reconnect.
+app.get('/api/youtube/analytics-timeseries', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const channel = await channelWithTokens(req.query.channel_row_id);
+    const access = await ytAccessToken(channel);
+    const fmt = (d) => d.toISOString().slice(0, 10);
+    const start = fmt(new Date(Date.now() - 28 * 864e5));
+    const end = fmt(new Date());
+    const url = 'https://youtubeanalytics.googleapis.com/v2/reports?ids=channel==MINE'
+      + `&startDate=${start}&endDate=${end}`
+      + '&metrics=views,estimatedMinutesWatched,averageViewPercentage&dimensions=day&sort=day';
+    const r = await fetch(url, { headers: { Authorization: `Bearer ${access}` } });
+    const d = await r.json();
+    if (!r.ok) {
+      const msg = JSON.stringify(d);
+      if (r.status === 403 || /insufficient|scope|forbidden/i.test(msg)) return res.json({ needs_reconnect: true });
+      throw new Error('analytics error: ' + msg.slice(0, 200));
+    }
+    const rows = (d.rows || []).map((row) => ({ date: row[0], views: row[1], minutes: row[2], avgPct: row[3] }));
+    const totals = rows.reduce((a, x) => ({
+      views: a.views + (x.views || 0),
+      minutes: a.minutes + (x.minutes || 0),
+    }), { views: 0, minutes: 0 });
+    const avgPct = rows.length ? rows.reduce((s, x) => s + (x.avgPct || 0), 0) / rows.length : 0;
+    res.json({ rows, totals, avgPct });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// AI-suggest YouTube metadata (title/description/tags) from a video's topic+script.
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || '';
+app.get('/api/youtube/suggest-meta', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    if (!ANTHROPIC_KEY) return res.status(500).json({ error: 'AI not configured' });
+    const r = await sb('GET', `videos?id=eq.${encodeURIComponent(req.query.video_id)}&select=title,topic,script`);
+    const v = (r || [])[0];
+    if (!v) return res.status(404).json({ error: 'video not found' });
+
+    const prompt = `You write YouTube metadata for a legal explainer video by a UK law firm.
+Topic: ${v.topic || v.title || ''}
+Current title: ${v.title || '(none)'}
+Script excerpt: ${(v.script || '').slice(0, 1600)}
+
+Return ONLY a JSON object with keys:
+  "title": a compelling, SEO-friendly title, max 100 characters, no clickbait.
+  "description": 2-3 short paragraphs of plain text — a one-line hook, what viewers learn, and a soft close. No hashtags in the body.
+  "tags": an array of 10-15 short lowercase keyword strings relevant to the topic and UK law.`;
+
+    const ar = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-fable-5', max_tokens: 900, messages: [{ role: 'user', content: prompt }] }),
+    });
+    const data = await ar.json();
+    if (!ar.ok) throw new Error('AI error: ' + JSON.stringify(data).slice(0, 200));
+    const text = (data.content || []).map((c) => c.text || '').join('');
+    const m = text.match(/\{[\s\S]*\}/);
+    if (!m) throw new Error('AI returned no JSON');
+    const meta = JSON.parse(m[0]);
+    res.json({
+      title: String(meta.title || '').slice(0, 100),
+      description: String(meta.description || ''),
+      tags: Array.isArray(meta.tags) ? meta.tags.slice(0, 15) : [],
     });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
