@@ -654,22 +654,17 @@ app.get('/api/research/trending', async (req, res) => {
 });
 
 // Paste a competitor video link -> pull what we can and reverse-engineer a brief.
-app.post('/api/research/extract', async (req, res) => {
-  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
-  try {
-    const { url } = req.body || {};
-    const vid = String(url || '').match(/(?:v=|youtu\.be\/|shorts\/|embed\/)([\w-]{11})/);
-    if (!vid) return res.status(400).json({ error: 'paste a YouTube video link' });
+async function analyseRival(ytId) {
     const access = await ytToken();
-    const d = await ytGet(`videos?part=snippet,contentDetails,statistics&id=${vid[1]}`, access);
+    const d = await ytGet(`videos?part=snippet,contentDetails,statistics&id=${ytId}`, access);
     const it = (d.items || [])[0];
-    if (!it) return res.status(404).json({ error: 'video not found' });
+    if (!it) throw new Error('video not found');
 
     // captions are only downloadable by the owner, so try the public timedtext
     // endpoint and fall back to title/description if it isn't available
     let transcript = '';
     try {
-      const t = await fetch(`https://www.youtube.com/api/timedtext?v=${vid[1]}&lang=en&fmt=json3`);
+      const t = await fetch(`https://www.youtube.com/api/timedtext?v=${ytId}&lang=en&fmt=json3`);
       if (t.ok) {
         const j = await t.json();
         transcript = (j.events || []).flatMap((e) => (e.segs || []).map((s) => s.utf8)).join(' ')
@@ -689,11 +684,41 @@ app.post('/api/research/extract', async (req, res) => {
       + '"hooks":["3 alternative opening lines, original wording"],'
       + '"our_angle":"how our version should differ to be more useful"}', 1800);
 
-    res.json({
-      video: { id: it.id, title: it.snippet.title, channel: it.snippet.channelTitle,
-               views: Number(it.statistics.viewCount || 0), thumb: it.snippet.thumbnails?.medium?.url },
-      had_transcript: !!transcript, ...out,
+  return {
+    video: { id: it.id, title: it.snippet.title, channel: it.snippet.channelTitle,
+             views: Number(it.statistics.viewCount || 0), thumb: it.snippet.thumbnails?.medium?.url },
+    had_transcript: !!transcript, ...out,
+  };
+}
+
+app.post('/api/research/extract', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const m = String((req.body || {}).url || '').match(/(?:v=|youtu\.be\/|shorts\/|embed\/)([\w-]{11})/);
+    if (!m) return res.status(400).json({ error: 'paste a YouTube video link' });
+    res.json(await analyseRival(m[1]));
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// Turn a rival's winning video straight into one of ours, briefed to beat it.
+app.post('/api/research/beat', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const { yt_id, url, style, brand_id } = req.body || {};
+    const id = yt_id || (String(url || '').match(/(?:v=|youtu\.be\/|shorts\/|embed\/)([\w-]{11})/) || [])[1];
+    if (!id) return res.status(400).json({ error: 'a YouTube video id or link is required' });
+    const a = await analyseRival(id);
+    const brief = `${a.topic}\n\nThis is going up against "${a.video.title}" by ${a.video.channel}`
+      + ` (${a.video.views.toLocaleString()} views). Beat it: ${a.our_angle}`;
+    const v = (await sb('POST', 'videos', {
+      title: a.video.title, topic: brief,
+      style: style || 'vyond', brand_id: brand_id || null, status: 'queued',
+    }))[0];
+    await sb('POST', 'jobs', {
+      type: 'plan', video_id: v.id,
+      payload: { style: style || 'vyond', topic: brief, brand_id: brand_id || null },
     });
+    res.json({ video_id: v.id, beating: a.video.title, angle: a.our_angle });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
