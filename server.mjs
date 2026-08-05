@@ -388,13 +388,32 @@ app.post('/api/series', async (req, res) => {
       cast_keys: Array.isArray(cast_keys) ? cast_keys : [],
     }))[0];
 
-    const n = episode_count ? `exactly ${episode_count}` : 'the right number (4-6)';
+    const n = episode_count ? `exactly ${episode_count}` : 'the right number (8-12)';
+
+    // the showrunner is briefed by the style, not hardcoded — a kids season must
+    // not come back as legal explainers
+    const st = (await sb('GET', `styles?key=eq.${encodeURIComponent(style || 'vyond')}`
+      + '&select=name,director_who,director_rules'))[0] || {};
+    const who = st.director_who || 'the showrunner for an explainer video channel';
+    const rules = st.director_rules ? `\nHouse rules: ${st.director_rules}` : '';
+
+    // the cast are the reason people come back — name them in the episodes
+    const castRows = await sb('GET', `characters?style=eq.${encodeURIComponent(style || 'vyond')}`
+      + '&select=name,personality,relations');
+    const castLine = (castRows || []).length
+      ? '\nThe recurring cast (write the season around THEM — the audience follows these characters):\n'
+        + castRows.map((c) => `- ${c.name}${c.personality ? ` — ${c.personality}` : ''}`).join('\n')
+      : '';
+
     const plan = await aiJSON(
-      `You are the showrunner for a UK legal-explainer video channel${brandName ? ` (brand: ${brandName})` : ''}.
-Plan a coherent mini-series (a "season") of ${n} short standalone explainer episodes on the theme: "${topic}".
-Order them as a real learning arc (foundations -> specifics -> edge cases/advanced). Accurate UK law, no invented stats.
-Return ONLY JSON: {"season_title": "...", "episodes": [ {"title": "<=70 chars", "angle": "one sentence describing exactly what this episode explains — this becomes the video brief", "synopsis": "one viewer-facing sentence"} ]}`,
-      2500);
+      `You are ${who}${brandName ? ` (brand: ${brandName})` : ''}.${rules}${castLine}
+Plan a coherent series (a "season") of ${n} standalone episodes on the theme: "${topic}".
+Give the SEASON a title an audience would follow, then title each episode so the subject is obvious at a glance —
+e.g. a season "Around the World" has "Episode 1 — Japan", "Episode 2 — Morocco"; a season "Leo Learns Arabic" has
+"Episode 1 — The Alphabet, Part 1". Order them as a real arc (foundations -> specifics -> advanced).
+Every episode must stand alone for someone who starts there. No invented facts or statistics.
+Return ONLY JSON: {"season_title": "...", "episodes": [ {"title": "<=70 chars", "angle": "one sentence describing exactly what this episode covers — this becomes the video brief", "synopsis": "one viewer-facing sentence"} ]}`,
+      4000);
 
     const updated = (await sb('PATCH', `series?id=eq.${srow.id}`, {
       status: 'plan_review', plan,
@@ -430,7 +449,8 @@ app.delete('/api/series/:id', async (req, res) => {
   catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
-// Approve a season plan -> create one video (+ plan job) per episode.
+// Approve a season plan. Episodes are NOT generated here — Karim wanted the
+// season laid out first, then each episode made with one click.
 app.post('/api/series/:id/approve', async (req, res) => {
   if (!authed(req)) return res.status(401).json({ error: 'unauth' });
   try {
@@ -438,29 +458,46 @@ app.post('/api/series/:id/approve', async (req, res) => {
     if (!s) return res.status(404).json({ error: 'not found' });
     const episodes = (req.body && req.body.episodes) || (s.plan && s.plan.episodes) || [];
     if (!episodes.length) return res.status(400).json({ error: 'no episodes to create' });
-
-    for (let i = 0; i < episodes.length; i++) {
-      const ep = episodes[i];
-      // a series keeps one fixed cast so the characters never drift between episodes
-      const cast = Array.isArray(s.cast_keys) ? s.cast_keys : [];
-      const v = (await sb('POST', 'videos', {
-        title: ep.title || `Episode ${i + 1}`, topic: ep.angle || ep.title || s.topic,
-        style: s.style || 'vyond', brand_id: s.brand_id || null,
-        series_id: s.id, episode_idx: i, status: 'queued',
-        progress: cast.length ? { cast_keys: cast } : {},
-      }))[0];
-      await sb('POST', 'jobs', {
-        type: 'plan', video_id: v.id,
-        payload: { style: s.style || 'vyond', topic: ep.angle || ep.title || s.topic,
-                   brand_id: s.brand_id || null, series_id: s.id,
-                   cast_keys: cast.length ? cast : undefined },
-      });
-    }
     const updated = (await sb('PATCH', `series?id=eq.${s.id}`, {
-      status: 'generating', plan: { ...(s.plan || {}), episodes },
+      status: 'ready', plan: { ...(s.plan || {}), episodes },
       episode_count: episodes.length, updated_at: new Date().toISOString(),
     }))[0];
     res.json(updated);
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// Generate one episode of an approved season.
+app.post('/api/series/:id/episodes/:idx/generate', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const s = (await sb('GET', `series?id=eq.${encodeURIComponent(req.params.id)}&select=*`))[0];
+    if (!s) return res.status(404).json({ error: 'not found' });
+    const idx = parseInt(req.params.idx, 10);
+    const ep = ((s.plan || {}).episodes || [])[idx];
+    if (!ep) return res.status(404).json({ error: 'no such episode' });
+
+    const existing = await sb('GET', `videos?series_id=eq.${s.id}&episode_idx=eq.${idx}&select=id,status`);
+    if (existing && existing[0]) return res.json({ already: true, video_id: existing[0].id, status: existing[0].status });
+
+    // a series keeps one fixed cast so the characters never drift between episodes
+    const cast = Array.isArray(s.cast_keys) ? s.cast_keys : [];
+    const brief = `${ep.angle || ep.title || s.topic}\n\n(Episode ${idx + 1} of the series "${s.title || s.topic}".`
+      + ` It must stand alone for a viewer who starts here.)`;
+    const v = (await sb('POST', 'videos', {
+      title: ep.title || `Episode ${idx + 1}`, topic: brief,
+      style: s.style || 'vyond', brand_id: s.brand_id || null,
+      series_id: s.id, episode_idx: idx, status: 'queued',
+      progress: cast.length ? { cast_keys: cast } : {},
+    }))[0];
+    await sb('POST', 'jobs', {
+      type: 'plan', video_id: v.id,
+      payload: { style: s.style || 'vyond', topic: brief, brand_id: s.brand_id || null,
+                 series_id: s.id, cast_keys: cast.length ? cast : undefined },
+    });
+    if (s.status !== 'generating') {
+      await sb('PATCH', `series?id=eq.${s.id}`, { status: 'generating', updated_at: new Date().toISOString() });
+    }
+    res.json({ video_id: v.id, episode_idx: idx });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
@@ -911,7 +948,8 @@ const STYLE_LOOK = {
 app.post('/api/characters', async (req, res) => {
   if (!authed(req)) return res.status(401).json({ error: 'unauth' });
   try {
-    const { name, description, style, brand_id, image_base64, image_mime } = req.body || {};
+    const { name, description, style, brand_id, image_base64, image_mime,
+            personality, relations, derived_from, voice_name, voice_style } = req.body || {};
     if (!name) return res.status(400).json({ error: 'give the character a name' });
     if (!description && !image_base64) {
       return res.status(400).json({ error: 'describe the character, upload a picture, or both' });
@@ -927,9 +965,27 @@ app.post('/api/characters', async (req, res) => {
       if (sr && sr[0] && sr[0].look_prompt) look = sr[0].look_prompt;
     } catch { /* fall back to the generic look */ }
 
+    // deriving from an existing character: use THEIR locked reference as the
+    // starting point so a sibling, parent or younger self shares the family look
+    let baseRef = null, baseName = '';
+    if (derived_from) {
+      const br = await sb('GET', `characters?id=eq.${encodeURIComponent(derived_from)}&select=name,ref_url,description`);
+      if (br && br[0] && br[0].ref_url) {
+        const img = await fetch(br[0].ref_url);
+        if (img.ok) { baseRef = Buffer.from(await img.arrayBuffer()).toString('base64'); baseName = br[0].name; }
+      }
+    }
+
     const parts = [];
     let prompt;
-    if (image_base64) {
+    if (baseRef && !image_base64) {
+      parts.push({ inline_data: { mime_type: 'image/png', data: baseRef } });
+      prompt = `${look}\n\nThe supplied picture shows ${baseName}. Create a NEW, DIFFERENT character who is `
+        + `related to them: ${description}. Keep a clear family resemblance — similar face shape, skin tone and `
+        + `hair colour — but they must be visibly a different person of the described age and look. `
+        + `Full body, facing forward, neutral friendly pose, centred on a plain solid white background, `
+        + `model-sheet style. No text, letters, numbers, logos or watermarks.`;
+    } else if (image_base64) {
       // redraw whatever they uploaded into this style, keeping the likeness
       parts.push({ inline_data: { mime_type: image_mime || 'image/png', data: image_base64 } });
       prompt = `${look}\n\nRedraw the character in the supplied picture in EXACTLY this art style. `
@@ -973,7 +1029,9 @@ app.post('/api/characters', async (req, res) => {
     const row = await sb('POST', 'characters', {
       key, name, description: description || `${name} (from a supplied picture)`,
       style: style || null, brand_id: brand_id || null,
-      voice_name: (req.body || {}).voice_name || null, voice_style: (req.body || {}).voice_style || null,
+      voice_name: voice_name || null, voice_style: voice_style || null,
+      personality: personality || null, relations: relations || null,
+      derived_from: derived_from || null,
       ref_asset: (Array.isArray(asset) ? asset[0] : asset).id, ref_url,
     });
     res.json(Array.isArray(row) ? row[0] : row);
