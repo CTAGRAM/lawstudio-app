@@ -743,9 +743,14 @@ app.post('/api/refine-brief', async (req, res) => {
       `You are ${who}${brandName ? ` for the brand "${brandName}"` : ''}${niche ? ` (${niche})` : ''}.
 Someone has jotted down a rough idea for the next video. Turn it into something they can approve as-is.
 ROUGH IDEA: "${String(rough).trim()}"
+Write in BRITISH ENGLISH for a UK audience — UK spelling (organise, labour, programme), UK law and UK
+institutions only. Never American spelling, never US law, never US concepts like "unemployment benefits",
+"attorney" or "PTO". If the subject is legal, it is the law of England and Wales unless told otherwise.
 Write a title a real viewer would click — specific, plain English, no colons-and-buzzwords, max 70 characters.
 Then write the brief: what the video should explain, who it is for, the angle, and the one thing a viewer must
 remember. Two or three sentences, written as an instruction to the studio. Accurate — invent no facts or statistics.
+The brief is read aloud to the studio as-is: write only the substance, with no notes to the writer, no
+"verify this", no caveats about sourcing, and no mention of scripting or research.
 Return ONLY JSON: {"title":"...","brief":"..."}`, 1200);
 
     res.json({ title: out.title || '', brief: out.brief || '' });
