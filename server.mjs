@@ -740,12 +740,16 @@ app.post('/api/refine-brief', async (req, res) => {
     const who = st.director_who || 'the director of an explainer video channel';
 
     const out = await aiJSON(
-      `You are ${who}${brandName ? ` for the brand "${brandName}"` : ''}${niche ? ` (${niche})` : ''}.
+      `WRITE FOR THE UNITED KINGDOM. This is a British company making videos for British viewers.
+Use British spelling throughout (organise, labour, programme, apologise). Refer only to UK law, UK bodies
+and UK terms — ACAS, an employment tribunal, statutory notice, Universal Credit, HMRC, England and Wales.
+NEVER write American spelling or American concepts. The words "unemployment benefits", "attorney", "labor",
+"PTO", "vacation", "your state", "local rules" and "varies by location" are BANNED — the UK has one national
+system, so never hedge about jurisdiction varying.
+
+You are ${who}${brandName ? ` for the brand "${brandName}"` : ''}${niche ? ` (${niche})` : ''}.
 Someone has jotted down a rough idea for the next video. Turn it into something they can approve as-is.
 ROUGH IDEA: "${String(rough).trim()}"
-Write in BRITISH ENGLISH for a UK audience — UK spelling (organise, labour, programme), UK law and UK
-institutions only. Never American spelling, never US law, never US concepts like "unemployment benefits",
-"attorney" or "PTO". If the subject is legal, it is the law of England and Wales unless told otherwise.
 Write a title a real viewer would click — specific, plain English, no colons-and-buzzwords, max 70 characters.
 Then write the brief: what the video should explain, who it is for, the angle, and the one thing a viewer must
 remember. Two or three sentences, written as an instruction to the studio. Accurate — invent no facts or statistics.
