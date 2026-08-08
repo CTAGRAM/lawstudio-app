@@ -722,6 +722,36 @@ app.post('/api/research/beat', async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
+// "I'm lazy and I'm tired one day and I just say: a video on X, Y and Z, click
+// refine, and it comes up with a clean title and a draft brief." — turn one line
+// into something ready to approve.
+app.post('/api/refine-brief', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const { rough, brand_id, style } = req.body || {};
+    if (!rough || !String(rough).trim()) return res.status(400).json({ error: 'write a line about the video first' });
+
+    let brandName = '', niche = '';
+    if (brand_id) {
+      const b = await sb('GET', `brands?id=eq.${encodeURIComponent(brand_id)}&select=name,niche,director_who`);
+      if (b && b[0]) { brandName = b[0].name || ''; niche = b[0].niche || ''; }
+    }
+    const st = (await sb('GET', `styles?key=eq.${encodeURIComponent(style || 'vyond')}&select=name,director_who`))[0] || {};
+    const who = st.director_who || 'the director of an explainer video channel';
+
+    const out = await aiJSON(
+      `You are ${who}${brandName ? ` for the brand "${brandName}"` : ''}${niche ? ` (${niche})` : ''}.
+Someone has jotted down a rough idea for the next video. Turn it into something they can approve as-is.
+ROUGH IDEA: "${String(rough).trim()}"
+Write a title a real viewer would click — specific, plain English, no colons-and-buzzwords, max 70 characters.
+Then write the brief: what the video should explain, who it is for, the angle, and the one thing a viewer must
+remember. Two or three sentences, written as an instruction to the studio. Accurate — invent no facts or statistics.
+Return ONLY JSON: {"title":"...","brief":"..."}`, 1200);
+
+    res.json({ title: out.title || '', brief: out.brief || '' });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
 // ------------------------------------------------------------------ Thumbnails
 // Generate a few 16:9 thumbnail options for a video. The image model handles the
 // art; the headline is chosen by Fable 5 from the video's own topic.
