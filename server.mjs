@@ -1169,6 +1169,41 @@ app.post('/api/shorts', async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
+// Render worker queue — single-worker system, so "running" is a boolean and
+// anything else queued is genuinely waiting. Powers the header status dot.
+app.get('/api/queue', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const rows = await sb('GET', 'jobs?status=in.(queued,claimed,running)&select=status,type') || [];
+    const running = rows.filter((r) => r.status === 'running' || r.status === 'claimed').length;
+    const queued = rows.filter((r) => r.status === 'queued').length;
+    res.json({ running, queued, busy: running > 0 });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// Real render timings from recent finished videos, so the ETA is measured, not
+// guessed. Returns median seconds-per-beat and median assemble seconds.
+app.get('/api/render-stats', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const rows = await sb('GET', 'videos?status=eq.done&select=progress&order=created_at.desc&limit=40') || [];
+    const perBeat = [], assemble = [];
+    for (const r of rows) {
+      const p = r.progress || {};
+      if (p.gen_started_at && p.gen_done_at && p.gen_total) {
+        const s = (new Date(p.gen_done_at) - new Date(p.gen_started_at)) / 1000 / p.gen_total;
+        if (s > 2 && s < 600) perBeat.push(s);
+      }
+      if (p.assemble_started_at && p.finished_at) {
+        const s = (new Date(p.finished_at) - new Date(p.assemble_started_at)) / 1000;
+        if (s > 5 && s < 3600) assemble.push(s);
+      }
+    }
+    const median = (a) => a.length ? a.slice().sort((x, y) => x - y)[Math.floor(a.length / 2)] : null;
+    res.json({ perBeat: median(perBeat), assembleS: median(assemble), samples: { perBeat: perBeat.length, assemble: assemble.length } });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
 // AI-suggest YouTube metadata (title/description/tags) from a video's topic+script.
 app.get('/api/youtube/suggest-meta', async (req, res) => {
   if (!authed(req)) return res.status(401).json({ error: 'unauth' });
