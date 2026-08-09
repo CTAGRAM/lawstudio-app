@@ -1009,11 +1009,29 @@ const STYLE_LOOK = {
   vox: 'Editorial paper-collage cut-out character with torn paper edges and halftone texture.',
 };
 
+// Create a cloned voice from a recorded sample (ElevenLabs Instant Voice Cloning).
+// Returns the new voice_id. Node 20 has global FormData/Blob/fetch.
+async function elevenClone(name, bytes, mime, ext) {
+  const key = process.env.ELEVENLABS_API_KEY;
+  if (!key) throw new Error('no ElevenLabs API key configured (add ELEVENLABS_API_KEY — Instant Voice Cloning is on the Starter plan and up)');
+  const fd = new FormData();
+  fd.append('name', String(name).slice(0, 60));
+  fd.append('remove_background_noise', 'true');
+  fd.append('files', new Blob([bytes], { type: mime || 'audio/mpeg' }), `sample.${ext || 'mp3'}`);
+  const r = await fetch('https://api.elevenlabs.io/v1/voices/add', {
+    method: 'POST', headers: { 'xi-api-key': key }, body: fd,
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok || !d.voice_id) throw new Error('elevenlabs clone failed: ' + JSON.stringify(d).slice(0, 200));
+  return d.voice_id;
+}
+
 app.post('/api/characters', async (req, res) => {
   if (!authed(req)) return res.status(401).json({ error: 'unauth' });
   try {
     const { name, description, style, brand_id, image_base64, image_mime,
-            personality, relations, derived_from, voice_name, voice_style } = req.body || {};
+            personality, relations, derived_from, voice_name, voice_style,
+            voice_sample_b64, voice_sample_mime } = req.body || {};
     if (!name) return res.status(400).json({ error: 'give the character a name' });
     if (!description && !image_base64) {
       return res.status(400).json({ error: 'describe the character, upload a picture, or both' });
@@ -1088,6 +1106,31 @@ app.post('/api/characters', async (req, res) => {
       kind: 'char_ref', title: `${name} (character)`, tags: ['character', style || 'vyond'],
       style: style || null, brand_id: brand_id || null, storage_path: path, mime: 'image/png',
     });
+    // custom voice: clone the presenter's recorded sample so this character
+    // speaks in their real voice. The sample is kept either way, so if the
+    // clone can't run yet (no key) it can be cloned later without re-recording.
+    let voiceProvider = null, voiceId = null, voiceSamplePath = null, voiceNote = null;
+    if (voice_sample_b64) {
+      try {
+        const sbytes = Buffer.from(voice_sample_b64, 'base64');
+        const m = voice_sample_mime || 'audio/mpeg';
+        const ext = m.includes('wav') ? 'wav' : m.includes('webm') ? 'webm'
+          : (m.includes('mp4') || m.includes('m4a') || m.includes('aac')) ? 'm4a' : 'mp3';
+        voiceSamplePath = `voice/${crypto.randomUUID()}.${ext}`;
+        const vu = await fetch(`${SB_URL}/storage/v1/object/assets/${voiceSamplePath}`, {
+          method: 'POST', headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`, 'Content-Type': m, 'x-upsert': 'true' },
+          body: sbytes,
+        });
+        if (!vu.ok) throw new Error('sample upload failed');
+        voiceId = await elevenClone(name, sbytes, m, ext);
+        voiceProvider = 'elevenlabs';
+      } catch (e) {
+        // keep the sample; mark it so it can be cloned once the key is in place
+        voiceProvider = voiceSamplePath ? 'elevenlabs_pending' : null;
+        voiceNote = String(e.message || e);
+      }
+    }
+
     const key = String(name).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').slice(0, 24)
       + '_' + crypto.randomUUID().slice(0, 4);
     const row = await sb('POST', 'characters', {
@@ -1096,9 +1139,11 @@ app.post('/api/characters', async (req, res) => {
       voice_name: voice_name || null, voice_style: voice_style || null,
       personality: personality || null, relations: relations || null,
       derived_from: derived_from || null,
+      voice_provider: voiceProvider, voice_id: voiceId, voice_sample: voiceSamplePath,
       ref_asset: (Array.isArray(asset) ? asset[0] : asset).id, ref_url,
     });
-    res.json(Array.isArray(row) ? row[0] : row);
+    const out = Array.isArray(row) ? row[0] : row;
+    res.json(voiceNote ? { ...out, voice_note: voiceNote } : out);
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
