@@ -1169,6 +1169,45 @@ app.post('/api/shorts', async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
+// Screen-recording flow (Go Legal AI): Karim records the screen himself, uploads
+// it, and the worker tops-and-tails it with the brand intro/outro. Step 1: mint a
+// signed upload URL so the (possibly large) file goes straight to storage, not
+// through this host.
+app.post('/api/screencast/sign', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const ext = (String((req.body || {}).filename || '').match(/\.(mp4|mov|webm|mkv|m4v)$/i) || ['.mp4'])[0].toLowerCase();
+    const rand = Math.random().toString(36).slice(2, 8);
+    const path = `screencast/${Date.now()}-${rand}${ext}`;
+    const r = await fetch(`${SB_URL}/storage/v1/object/upload/sign/assets/${path}`, {
+      method: 'POST', headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}` },
+    });
+    const d = await r.json();
+    if (!d.url) return res.status(500).json({ error: 'could not sign upload' });
+    res.json({ path, uploadUrl: `${SB_URL}/storage/v1${d.url}` });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// Step 2: once uploaded, create the asset + video + screencast job.
+app.post('/api/screencast/create', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const { path, title, topic, brand_id, music } = req.body || {};
+    if (!path) return res.status(400).json({ error: 'no uploaded file path' });
+    if (!brand_id) return res.status(400).json({ error: 'pick a brand first' });
+    const a = await sb('POST', 'assets', { kind: 'clip', title: title || 'screen recording',
+      storage_path: path, mime: 'video/mp4', tags: ['screencast', 'upload'], brand_id });
+    const asset = Array.isArray(a) ? a[0] : a;
+    const v = await sb('POST', 'videos', { title: title || 'Screen recording', topic: topic || null,
+      style: 'screencast', kind: 'screencast', brand_id, status: 'queued',
+      progress: { source_asset: asset.id, music: !!music } });
+    const video = Array.isArray(v) ? v[0] : v;
+    await sb('POST', 'jobs', { type: 'screencast', video_id: video.id,
+      payload: { source_asset: asset.id, music: !!music } });
+    res.json({ video_id: video.id });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
 // Render worker queue — single-worker system, so "running" is a boolean and
 // anything else queued is genuinely waiting. Powers the header status dot.
 app.get('/api/queue', async (req, res) => {
