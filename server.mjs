@@ -1253,6 +1253,70 @@ app.post('/api/screencast/create', async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
+// Master storyboard chat: edit the plan in plain English BEFORE anything is
+// generated. Rewrites the narration and shot descriptions of the affected beats,
+// grounded in the brand's director rules so it stays legally accurate. Instant
+// and free — nothing is regenerated.
+app.post('/api/storyboard/chat', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const { video_id, instruction } = req.body || {};
+    if (!video_id || !instruction) return res.status(400).json({ error: 'video_id and instruction required' });
+    const v = (await sb('GET', `videos?id=eq.${encodeURIComponent(video_id)}&select=topic,style,brand_id`))[0];
+    if (!v) return res.status(404).json({ error: 'video not found' });
+    let rules = '';
+    if (v.brand_id) {
+      const b = await sb('GET', `brands?id=eq.${v.brand_id}&select=director_rules,name`);
+      if (b && b[0] && b[0].director_rules) rules = `\nBRAND RULES (must always hold):\n${b[0].director_rules}\n`;
+    }
+    const beats = await sb('GET', `video_beats?video_id=eq.${encodeURIComponent(video_id)}&select=id,idx,kind,vo_text,scene_prompt&order=idx.asc`) || [];
+    if (!beats.length) return res.status(400).json({ error: 'no storyboard to edit yet' });
+    const digest = beats.map((b) => ({ idx: b.idx, kind: b.kind, vo: b.vo_text || '', still: (b.scene_prompt || '').slice(0, 300) }));
+
+    const out = await aiJSON(
+      `You are the editor of a UK video storyboard. The user wants changes BEFORE it is generated.${rules}
+TOPIC: ${v.topic || ''}
+CURRENT STORYBOARD (one object per shot): ${JSON.stringify(digest)}
+USER INSTRUCTION: "${String(instruction).trim()}"
+Apply the instruction. Rewrite ONLY the shots it affects — leave every other shot's text byte-for-byte identical.
+For each shot keep its idx and kind. "vo" is what is spoken (British English, factually and legally accurate,
+no invented figures); "still" is the visual description (no on-screen text/letters). Do NOT add or remove shots,
+do NOT change casting. If the instruction is a question or can't be applied, make no changes and say so.
+Return ONLY JSON: {"reply":"one short sentence on what you changed","beats":[{"idx":N,"vo":"...","still":"..."}]}`,
+      3500);
+
+    const byIdx = {}; for (const b of beats) byIdx[b.idx] = b;
+    let changed = 0;
+    for (const nb of (out.beats || [])) {
+      const cur = byIdx[nb.idx]; if (!cur) continue;
+      const patch = {};
+      if (typeof nb.vo === 'string' && nb.vo.trim() && nb.vo.trim() !== (cur.vo_text || '').trim()) patch.vo_text = nb.vo.trim();
+      if (typeof nb.still === 'string' && nb.still.trim() && nb.still.trim() !== (cur.scene_prompt || '').trim()) patch.scene_prompt = nb.still.trim();
+      if (Object.keys(patch).length) { await sb('PATCH', `video_beats?id=eq.${cur.id}`, patch); changed++; }
+    }
+    res.json({ reply: out.reply || (changed ? `Updated ${changed} shot${changed > 1 ? 's' : ''}.` : 'No changes were needed.'), changed });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// Give the storyboard a fresh brief and re-plan the whole thing (still $0 — only
+// the plan is redrawn, nothing is generated).
+app.post('/api/storyboard/replan', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const { video_id, brief } = req.body || {};
+    if (!video_id || !brief || !String(brief).trim()) return res.status(400).json({ error: 'video_id and a brief are required' });
+    const v = (await sb('GET', `videos?id=eq.${encodeURIComponent(video_id)}&select=style,brand_id,progress`))[0];
+    if (!v) return res.status(404).json({ error: 'video not found' });
+    const cast = ((v.progress || {}).cast_keys) || [];
+    await sb('PATCH', `videos?id=eq.${encodeURIComponent(video_id)}`, { topic: String(brief).trim(), status: 'planning' });
+    await sb('DELETE', `video_beats?video_id=eq.${encodeURIComponent(video_id)}`);
+    await sb('POST', 'jobs', { type: 'plan', video_id,
+      payload: { style: v.style, topic: String(brief).trim(), brand_id: v.brand_id || null,
+                 cast_keys: cast.length ? cast : undefined } });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
 // Render worker queue — single-worker system, so "running" is a boolean and
 // anything else queued is genuinely waiting. Powers the header status dot.
 app.get('/api/queue', async (req, res) => {
