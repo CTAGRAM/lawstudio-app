@@ -1317,6 +1317,23 @@ app.post('/api/storyboard/replan', async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
+// Stop an expensive run. Sets a cancel flag the worker checks between beats (and
+// before rendering), and removes any not-yet-started jobs so nothing new begins.
+app.post('/api/videos/:id/stop', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const vid = req.params.id;
+    const v = (await sb('GET', `videos?id=eq.${encodeURIComponent(vid)}&select=progress,status`))[0];
+    if (!v) return res.status(404).json({ error: 'video not found' });
+    // drop queued jobs for this video so nothing else spins up
+    await sb('DELETE', `jobs?video_id=eq.${encodeURIComponent(vid)}&status=eq.queued`);
+    // flag the in-flight run to stop at the next beat / before render
+    await sb('PATCH', `videos?id=eq.${encodeURIComponent(vid)}`,
+             { progress: { ...(v.progress || {}), cancel: true } });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
 // Render worker queue — single-worker system, so "running" is a boolean and
 // anything else queued is genuinely waiting. Powers the header status dot.
 app.get('/api/queue', async (req, res) => {
