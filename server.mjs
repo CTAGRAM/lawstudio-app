@@ -1253,6 +1253,28 @@ app.post('/api/screencast/create', async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
+// Record a live URL into an explainer (browsercast). The separate recorder
+// service polls videos where progress->>via='browsercast'; we deliberately do
+// NOT create a 'jobs' row, so the Python video worker never claims these.
+// Public URLs only for now — auth/credentials are not stored on the (anon-
+// readable) videos row.
+app.post('/api/browsercast', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const { url, goal, title, brand_id } = req.body || {};
+    if (!url) return res.status(400).json({ error: 'url required' });
+    if (!brand_id) return res.status(400).json({ error: 'pick a brand first' });
+    let host; try { host = new URL(url).host.replace(/^www\./, ''); }
+    catch { return res.status(400).json({ error: 'invalid url' }); }
+    const v = await sb('POST', 'videos', {
+      title: title || `${host} — walkthrough`, topic: url,
+      style: 'screencast', kind: 'screencast', brand_id, status: 'queued',
+      progress: { via: 'browsercast', url, goal: goal || '', aspectPack: true } });
+    const video = Array.isArray(v) ? v[0] : v;
+    res.json({ video_id: video.id });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
 // Master storyboard chat: edit the plan in plain English BEFORE anything is
 // generated. Rewrites the narration and shot descriptions of the affected beats,
 // grounded in the brand's director rules so it stays legally accurate. Instant
