@@ -1261,7 +1261,7 @@ app.post('/api/screencast/create', async (req, res) => {
 app.post('/api/browsercast', async (req, res) => {
   if (!authed(req)) return res.status(401).json({ error: 'unauth' });
   try {
-    const { url, goal, title, brand_id } = req.body || {};
+    const { url, goal, title, brand_id, thumbPrompt, thumbExample, aspectPack } = req.body || {};
     if (!url) return res.status(400).json({ error: 'url required' });
     if (!brand_id) return res.status(400).json({ error: 'pick a brand first' });
     let host; try { host = new URL(url).host.replace(/^www\./, ''); }
@@ -1269,7 +1269,8 @@ app.post('/api/browsercast', async (req, res) => {
     const v = await sb('POST', 'videos', {
       title: title || `${host} — walkthrough`, topic: url,
       style: 'screencast', kind: 'screencast', brand_id, status: 'queued',
-      progress: { via: 'browsercast', url, goal: goal || '', aspectPack: true } });
+      progress: { via: 'browsercast', url, goal: goal || '', aspectPack: !!aspectPack,
+        thumbPrompt: thumbPrompt || null, thumbExample: thumbExample || null } });
     const video = Array.isArray(v) ? v[0] : v;
     res.json({ video_id: video.id });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
