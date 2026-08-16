@@ -369,6 +369,27 @@ async function aiJSON(prompt, maxTokens = 1500) {
   return JSON.parse(m[0]);
 }
 
+// Available scriptwriter models (from the Anthropic models API) for the Create
+// model picker. Cached briefly so the dropdown is instant.
+let _modelCache = { at: 0, list: null };
+app.get('/api/models', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    if (_modelCache.list && Date.now() - _modelCache.at < 3600e3) return res.json(_modelCache.list);
+    if (!ANTHROPIC_KEY) return res.json([{ id: 'claude-fable-5', name: 'Claude Fable 5' }]);
+    const r = await fetch('https://api.anthropic.com/v1/models?limit=100', {
+      headers: { 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(JSON.stringify(d).slice(0, 200));
+    const list = (d.data || [])
+      .map((m) => ({ id: m.id, name: m.display_name || m.id }))
+      .filter((m) => m.id.startsWith('claude-'));
+    _modelCache = { at: Date.now(), list };
+    res.json(list);
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
 // -------------------------------------------------------------- Series engine
 // One brief -> AI plans a season -> user approves -> each episode becomes a
 // normal video (a 'plan' job), reusing the whole per-video pipeline.
@@ -767,7 +788,7 @@ Return ONLY JSON: {"title":"...","brief":"..."}`, 1200);
 app.post('/api/thumbnails', async (req, res) => {
   if (!authed(req)) return res.status(401).json({ error: 'unauth' });
   try {
-    const { video_id, count } = req.body || {};
+    const { video_id, count, prompt: userPrompt, example } = req.body || {};
     if (!video_id) return res.status(400).json({ error: 'video_id required' });
     const gem = process.env.GEMINI_API_KEY;
     if (!gem) return res.status(500).json({ error: 'image generation is not configured' });
@@ -776,17 +797,31 @@ app.post('/api/thumbnails', async (req, res) => {
     const v = (vr || [])[0];
     if (!v) return res.status(404).json({ error: 'video not found' });
 
+    const dir = (userPrompt || '').trim();   // optional creative direction (by description)
+
+    // optional reference image (by example): fetch once, pass into every generation
+    let refPart = null;
+    if (example) {
+      try {
+        const refUrl = /^https?:/.test(example) ? example : `${SB_URL}/storage/v1/object/public/assets/${example}`;
+        const rr = await fetch(refUrl);
+        if (rr.ok) refPart = { inlineData: { mimeType: rr.headers.get('content-type') || 'image/png',
+          data: Buffer.from(await rr.arrayBuffer()).toString('base64') } };
+      } catch { /* reference is optional */ }
+    }
+
     let ideas = [];
     try {
       const out = await aiJSON(
         `Design YouTube thumbnails for this video.\nTitle: ${v.title}\nTopic: ${v.topic || ''}\n`
+        + (dir ? `Creative direction from the user (follow it closely): ${dir}\n` : '')
         + `Give ${count || 3} distinct concepts. Each needs a punchy 2-4 WORD headline (it will be drawn `
         + `large on the thumbnail) and a one-sentence visual description that suits a `
         + `${v.style === 'kids' ? 'bright playful cartoon for children' : 'clean flat-2D explainer'}.\n`
         + 'Return ONLY JSON: {"ideas":[{"headline":"...","visual":"..."}]}', 900);
       ideas = out.ideas || [];
     } catch { /* fall back below */ }
-    if (!ideas.length) ideas = [{ headline: (v.title || 'Watch this').split(' ').slice(0, 3).join(' '), visual: v.topic || v.title }];
+    if (!ideas.length) ideas = [{ headline: (v.title || 'Watch this').split(' ').slice(0, 3).join(' '), visual: dir || v.topic || v.title }];
 
     const look = v.style === 'kids'
       ? "Bright friendly flat-2D cartoon for a children's channel, bold rounded shapes, cheerful palette"
@@ -795,12 +830,15 @@ app.post('/api/thumbnails', async (req, res) => {
     const made = [];
     for (const idea of ideas.slice(0, count || 3)) {
       const prompt = `YouTube thumbnail, 16:9, extremely eye-catching and readable at small size. ${look}. `
-        + `Scene: ${idea.visual}. Leave a clear area for a short headline. High contrast, bold, uncluttered. `
+        + `Scene: ${idea.visual}. ${dir ? `Creative direction: ${dir}. ` : ''}`
+        + `${refPart ? 'Use the supplied reference image as strong inspiration for composition, colour and overall style. ' : ''}`
+        + `Leave a clear area for a short headline. High contrast, bold, uncluttered. `
         + `Do not render any text, letters or numbers in the image.`;
       try {
+        const parts = refPart ? [refPart, { text: prompt }] : [{ text: prompt }];
         const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-image:generateContent?key=${gem}`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseModalities: ['IMAGE'] } }),
+          body: JSON.stringify({ contents: [{ parts }], generationConfig: { responseModalities: ['IMAGE'] } }),
         });
         const d = await r.json();
         const part = ((((d.candidates || [])[0] || {}).content || {}).parts || []).find((p) => p.inlineData);
