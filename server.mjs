@@ -1442,6 +1442,7 @@ const PUBLIC = path.join(__dirname, 'public');
 app.get('/about', (_req, res) => res.sendFile(path.join(PUBLIC, 'about.html')));
 app.get('/privacy', (_req, res) => res.sendFile(path.join(PUBLIC, 'privacy.html')));
 app.get('/terms', (_req, res) => res.sendFile(path.join(PUBLIC, 'terms.html')));
+app.get('/voice-lab', (_req, res) => res.sendFile(path.join(PUBLIC, 'voice-lab.html')));
 app.get('/login', (_req, res) => res.sendFile(path.join(__dirname, 'login.html')));
 
 // index.html must never be cached — it names the hashed JS bundle, so a stale
