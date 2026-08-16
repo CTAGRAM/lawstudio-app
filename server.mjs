@@ -1160,11 +1160,23 @@ app.post('/api/characters', async (req, res) => {
           body: sbytes,
         });
         if (!vu.ok) throw new Error('sample upload failed');
-        voiceId = await elevenClone(name, sbytes, m, ext);
-        voiceProvider = 'elevenlabs';
+        if (process.env.ELEVENLABS_API_KEY) {
+          // premium: a persistent ElevenLabs clone (best quality)
+          try {
+            voiceId = await elevenClone(name, sbytes, m, ext);
+            voiceProvider = 'elevenlabs';
+          } catch (e) {
+            voiceProvider = 'freeai';   // fall back to the free clone at speak time
+            voiceNote = 'ElevenLabs unavailable — using the free voice clone: ' + String(e.message || e).slice(0, 120);
+          }
+        } else {
+          // no ElevenLabs key: free zero-shot clone from the stored sample at
+          // generation time (Free.ai). No cost, nothing to configure.
+          voiceProvider = 'freeai';
+        }
       } catch (e) {
-        // keep the sample; mark it so it can be cloned once the key is in place
-        voiceProvider = voiceSamplePath ? 'elevenlabs_pending' : null;
+        // the sample couldn't even be stored — keep the character, note why
+        voiceProvider = null;
         voiceNote = String(e.message || e);
       }
     }
