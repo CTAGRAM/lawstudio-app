@@ -1057,8 +1057,37 @@ app.get('/api/voice-preview', async (req, res) => {
     const c = (cr || [])[0];
     if (!c) return res.status(404).json({ error: 'character not found' });
 
-    // custom voice: play their actual recorded sample (that IS their voice)
+    // custom voice: play the CLONED voice (what they'll actually sound like in
+    // videos), generated once via Free.ai and saved so replays are instant.
     if (c.voice_sample) {
+      const prevPath = `voice_preview/${id}.wav`;
+      const cached = await fetch(`${SB_URL}/storage/v1/object/public/assets/${prevPath}`);
+      if (cached.ok) {
+        res.set('Content-Type', 'audio/wav'); res.set('Cache-Control', 'private, max-age=3600');
+        return res.send(Buffer.from(await cached.arrayBuffer()));
+      }
+      const fk = process.env.FREEAI_API_KEY;
+      if (fk) {
+        try {
+          const sf = await fetch(`${SB_URL}/storage/v1/object/public/assets/${c.voice_sample}`);
+          const sbytes = Buffer.from(await sf.arrayBuffer());
+          const fd = new FormData();
+          fd.append('audio', new Blob([sbytes], { type: sf.headers.get('content-type') || 'audio/webm' }), 'sample');
+          fd.append('text', `Hi, I'm ${c.name || 'your presenter'}. This is how I'll sound in your videos.`);
+          const cr = await fetch('https://api.free.ai/v1/voice/clone/', { method: 'POST', headers: { Authorization: `Bearer ${fk}` }, body: fd });
+          const cj = await cr.json().catch(() => ({}));
+          if (cr.ok && cj.audio_url) {
+            const aud = await fetch(cj.audio_url);
+            const abytes = Buffer.from(await aud.arrayBuffer());
+            // save the clone so every later play is instant
+            await fetch(`${SB_URL}/storage/v1/object/assets/${prevPath}`, {
+              method: 'POST', headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`, 'Content-Type': 'audio/wav', 'x-upsert': 'true' }, body: abytes });
+            res.set('Content-Type', 'audio/wav'); res.set('Cache-Control', 'private, max-age=3600');
+            return res.send(abytes);
+          }
+        } catch { /* fall through to the raw sample */ }
+      }
+      // fallback (no Free.ai key or clone failed): play the raw recorded sample
       const f = await fetch(`${SB_URL}/storage/v1/object/public/assets/${c.voice_sample}`);
       if (!f.ok) return res.status(502).json({ error: 'sample unavailable' });
       res.set('Content-Type', f.headers.get('content-type') || 'audio/webm');
@@ -1122,7 +1151,7 @@ app.post('/api/characters', async (req, res) => {
   if (!authed(req)) return res.status(401).json({ error: 'unauth' });
   try {
     const { name, description, style, brand_id, image_base64, image_mime,
-            personality, relations, derived_from, voice_name, voice_style,
+            personality, relations, derived_from, derive_mode, voice_name, voice_style,
             voice_sample_b64, voice_sample_mime } = req.body || {};
     if (!name) return res.status(400).json({ error: 'give the character a name' });
     if (!description && !image_base64) {
@@ -1152,13 +1181,22 @@ app.post('/api/characters', async (req, res) => {
 
     const parts = [];
     let prompt;
-    if (baseRef && !image_base64) {
+    if (baseRef && !image_base64 && derive_mode === 'relative') {
+      // "Add a relative": a NEW, visibly different person who resembles the base
       parts.push({ inline_data: { mime_type: 'image/png', data: baseRef } });
       prompt = `${look}\n\nThe supplied picture shows ${baseName}. Create a NEW, DIFFERENT character who is `
         + `related to them: ${description}. Keep a clear family resemblance — similar face shape, skin tone and `
         + `hair colour — but they must be visibly a different person of the described age and look. `
         + `Full body, facing forward, neutral friendly pose, centred on a plain solid white background, `
         + `model-sheet style. No text, letters, numbers, logos or watermarks.`;
+    } else if (baseRef && !image_base64) {
+      // "Reuse a look": the SAME person, redrawn in the selected style
+      parts.push({ inline_data: { mime_type: 'image/png', data: baseRef } });
+      prompt = `${look}\n\nRedraw the person in the supplied picture in EXACTLY this art style. `
+        + `Keep them clearly recognisable as the SAME person — same face shape, skin tone, hair and build`
+        + (description ? `. Additional direction: ${description}` : '')
+        + `. Full body, facing forward, neutral friendly pose, centred on a plain solid white background, `
+        + `model-sheet style. Absolutely no text, letters, numbers, logos or watermarks.`;
     } else if (image_base64) {
       // redraw whatever they uploaded into this style, keeping the likeness
       parts.push({ inline_data: { mime_type: image_mime || 'image/png', data: image_base64 } });
@@ -1174,14 +1212,20 @@ app.post('/api/characters', async (req, res) => {
     }
     parts.push({ text: prompt });
 
-    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-image:generateContent?key=${gem}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ contents: [{ parts }], generationConfig: { responseModalities: ['IMAGE'] } }),
-    });
-    const d = await r.json();
-    if (!r.ok) throw new Error('image error: ' + JSON.stringify(d).slice(0, 200));
-    const part = ((((d.candidates || [])[0] || {}).content || {}).parts || []).find((p) => p.inlineData);
-    if (!part) throw new Error('no image returned');
+    // the image model occasionally returns no image (transient / safety wobble);
+    // retry a couple of times before giving up so creation doesn't just "fail"
+    let part = null, lastErr = '';
+    for (let attempt = 0; attempt < 3 && !part; attempt++) {
+      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-image:generateContent?key=${gem}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contents: [{ parts }], generationConfig: { responseModalities: ['IMAGE'] } }),
+      });
+      const d = await r.json();
+      if (!r.ok) { lastErr = 'image error: ' + JSON.stringify(d).slice(0, 200); await new Promise((s) => setTimeout(s, 1500)); continue; }
+      part = ((((d.candidates || [])[0] || {}).content || {}).parts || []).find((p) => p.inlineData);
+      if (!part) { lastErr = 'the image model returned no picture (it may have declined this reference — try a clearer photo or a description)'; await new Promise((s) => setTimeout(s, 1500)); }
+    }
+    if (!part) throw new Error(lastErr || 'no image returned');
 
     // upload the reference into the assets bucket
     const bytes = Buffer.from(part.inlineData.data, 'base64');
