@@ -1045,9 +1045,32 @@ function pcmToWav(pcm, rate) {
   return Buffer.concat([h, pcm]);
 }
 
-// Hear a character's voice: their actual recorded/custom sample if they have one,
-// otherwise a short synthesized preview in their preset voice (cached per voice).
+// Generate a character's cloned-voice preview in the BACKGROUND (Free.ai clone
+// takes ~60-90s, past any HTTP timeout) and save it so later plays are instant.
 const _voicePrev = new Map();
+const _cloneInflight = new Set();
+async function genClonePreview(id, samplePath, name) {
+  if (_cloneInflight.has(id)) return;
+  _cloneInflight.add(id);
+  try {
+    const sf = await fetch(`${SB_URL}/storage/v1/object/public/assets/${samplePath}`);
+    const sbytes = Buffer.from(await sf.arrayBuffer());
+    const fd = new FormData();
+    fd.append('audio', new Blob([sbytes], { type: sf.headers.get('content-type') || 'audio/webm' }), 'sample');
+    fd.append('text', `Hi, I'm ${name || 'your presenter'}. This is how I'll sound in your videos.`);
+    const cr = await fetch('https://api.free.ai/v1/voice/clone/', { method: 'POST', headers: { Authorization: `Bearer ${process.env.FREEAI_API_KEY}` }, body: fd });
+    const cj = await cr.json().catch(() => ({}));
+    if (!cr.ok || !cj.audio_url) throw new Error('clone failed: ' + JSON.stringify(cj).slice(0, 160));
+    const aud = await fetch(cj.audio_url);
+    const abytes = Buffer.from(await aud.arrayBuffer());
+    await fetch(`${SB_URL}/storage/v1/object/assets/voice_preview/${id}.wav`, {
+      method: 'POST', headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`, 'Content-Type': 'audio/wav', 'x-upsert': 'true' }, body: abytes });
+  } catch (e) { console.error('clone preview failed', id, String(e.message || e).slice(0, 120)); }
+  finally { _cloneInflight.delete(id); }
+}
+
+// Hear a character's voice: their cloned voice (custom) or a short synthesized
+// preview in their preset voice. Cloning is kicked off in the background.
 app.get('/api/voice-preview', async (req, res) => {
   if (!authed(req)) return res.status(401).json({ error: 'unauth' });
   try {
@@ -1057,37 +1080,20 @@ app.get('/api/voice-preview', async (req, res) => {
     const c = (cr || [])[0];
     if (!c) return res.status(404).json({ error: 'character not found' });
 
-    // custom voice: play the CLONED voice (what they'll actually sound like in
-    // videos), generated once via Free.ai and saved so replays are instant.
+    // custom voice: stream the CLONED voice if it's been made; otherwise kick off
+    // the (slow, ~60-90s) clone in the background and tell the client to poll —
+    // never block the request past its gateway timeout.
     if (c.voice_sample) {
-      const prevPath = `voice_preview/${id}.wav`;
-      const cached = await fetch(`${SB_URL}/storage/v1/object/public/assets/${prevPath}`);
+      const cached = await fetch(`${SB_URL}/storage/v1/object/public/assets/voice_preview/${id}.wav`);
       if (cached.ok) {
         res.set('Content-Type', 'audio/wav'); res.set('Cache-Control', 'private, max-age=3600');
         return res.send(Buffer.from(await cached.arrayBuffer()));
       }
-      const fk = process.env.FREEAI_API_KEY;
-      if (fk) {
-        try {
-          const sf = await fetch(`${SB_URL}/storage/v1/object/public/assets/${c.voice_sample}`);
-          const sbytes = Buffer.from(await sf.arrayBuffer());
-          const fd = new FormData();
-          fd.append('audio', new Blob([sbytes], { type: sf.headers.get('content-type') || 'audio/webm' }), 'sample');
-          fd.append('text', `Hi, I'm ${c.name || 'your presenter'}. This is how I'll sound in your videos.`);
-          const cr = await fetch('https://api.free.ai/v1/voice/clone/', { method: 'POST', headers: { Authorization: `Bearer ${fk}` }, body: fd });
-          const cj = await cr.json().catch(() => ({}));
-          if (cr.ok && cj.audio_url) {
-            const aud = await fetch(cj.audio_url);
-            const abytes = Buffer.from(await aud.arrayBuffer());
-            // save the clone so every later play is instant
-            await fetch(`${SB_URL}/storage/v1/object/assets/${prevPath}`, {
-              method: 'POST', headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`, 'Content-Type': 'audio/wav', 'x-upsert': 'true' }, body: abytes });
-            res.set('Content-Type', 'audio/wav'); res.set('Cache-Control', 'private, max-age=3600');
-            return res.send(abytes);
-          }
-        } catch { /* fall through to the raw sample */ }
+      if (process.env.FREEAI_API_KEY) {
+        genClonePreview(id, c.voice_sample, c.name);   // fire-and-forget; poll for the result
+        return res.status(202).json({ generating: true });
       }
-      // fallback (no Free.ai key or clone failed): play the raw recorded sample
+      // no Free.ai key: fall back to the raw recorded sample so play still works
       const f = await fetch(`${SB_URL}/storage/v1/object/public/assets/${c.voice_sample}`);
       if (!f.ok) return res.status(502).json({ error: 'sample unavailable' });
       res.set('Content-Type', f.headers.get('content-type') || 'audio/webm');
@@ -1291,6 +1297,8 @@ app.post('/api/characters', async (req, res) => {
       ref_asset: (Array.isArray(asset) ? asset[0] : asset).id, ref_url,
     });
     const out = Array.isArray(row) ? row[0] : row;
+    // warm the cloned-voice preview in the background so the first play is instant
+    if (out && out.voice_sample && process.env.FREEAI_API_KEY) genClonePreview(out.id, out.voice_sample, out.name);
     res.json(voiceNote ? { ...out, voice_note: voiceNote } : out);
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
