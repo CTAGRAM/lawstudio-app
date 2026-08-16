@@ -1035,6 +1035,60 @@ app.get('/api/voices', (req, res) => {
   res.json(VOICES);
 });
 
+// wrap raw mono 16-bit PCM in a WAV header (no ffmpeg needed in this container)
+function pcmToWav(pcm, rate) {
+  const h = Buffer.alloc(44);
+  h.write('RIFF', 0); h.writeUInt32LE(36 + pcm.length, 4); h.write('WAVE', 8);
+  h.write('fmt ', 12); h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20); h.writeUInt16LE(1, 22);
+  h.writeUInt32LE(rate, 24); h.writeUInt32LE(rate * 2, 28); h.writeUInt16LE(2, 32); h.writeUInt16LE(16, 34);
+  h.write('data', 36); h.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([h, pcm]);
+}
+
+// Hear a character's voice: their actual recorded/custom sample if they have one,
+// otherwise a short synthesized preview in their preset voice (cached per voice).
+const _voicePrev = new Map();
+app.get('/api/voice-preview', async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ error: 'unauth' });
+  try {
+    const id = req.query.id;
+    if (!id) return res.status(400).json({ error: 'id required' });
+    const cr = await sb('GET', `characters?id=eq.${encodeURIComponent(id)}&select=name,voice_name,voice_sample`);
+    const c = (cr || [])[0];
+    if (!c) return res.status(404).json({ error: 'character not found' });
+
+    // custom voice: play their actual recorded sample (that IS their voice)
+    if (c.voice_sample) {
+      const f = await fetch(`${SB_URL}/storage/v1/object/public/assets/${c.voice_sample}`);
+      if (!f.ok) return res.status(502).json({ error: 'sample unavailable' });
+      res.set('Content-Type', f.headers.get('content-type') || 'audio/webm');
+      res.set('Cache-Control', 'private, max-age=3600');
+      return res.send(Buffer.from(await f.arrayBuffer()));
+    }
+
+    // preset voice: synthesize a short line once, cache it per voice
+    const voice = c.voice_name || 'Charon';
+    if (_voicePrev.has(voice)) { res.set('Content-Type', 'audio/wav'); return res.send(_voicePrev.get(voice)); }
+    const gem = process.env.GEMINI_API_KEY;
+    if (!gem) return res.status(500).json({ error: 'voice preview not configured' });
+    const line = `Hi, I'm ${c.name || 'your presenter'}. This is how I sound in your videos.`;
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${gem}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contents: [{ parts: [{ text: `Say warmly in a clear British voice: ${line}` }] }],
+        generationConfig: { responseModalities: ['AUDIO'], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } } } }),
+    });
+    const d = await r.json();
+    const part = ((((d.candidates || [])[0] || {}).content || {}).parts || []).find((p) => p.inlineData);
+    if (!part) return res.status(502).json({ error: 'no audio returned' });
+    const pcm = Buffer.from(part.inlineData.data, 'base64');
+    const rate = parseInt((part.inlineData.mimeType.match(/rate=(\d+)/) || [])[1] || '24000', 10);
+    const wav = pcmToWav(pcm, rate);
+    _voicePrev.set(voice, wav);
+    res.set('Content-Type', 'audio/wav'); res.set('Cache-Control', 'private, max-age=3600');
+    return res.send(wav);
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
 // ---------------------------------------------------------- Custom characters
 // A character is a name + description + ONE locked reference image. Every scene
 // that features them is generated from that image, so they stay identical
