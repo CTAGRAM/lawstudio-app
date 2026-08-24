@@ -3,6 +3,9 @@ import cookieParser from 'cookie-parser';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import path from 'path';
+import os from 'os';
+import fs from 'fs';
+import { execFileSync } from 'child_process';
 
 const app = express();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -793,49 +796,86 @@ app.post('/api/thumbnails', async (req, res) => {
     const gem = process.env.GEMINI_API_KEY;
     if (!gem) return res.status(500).json({ error: 'image generation is not configured' });
 
-    const vr = await sb('GET', `videos?id=eq.${encodeURIComponent(video_id)}&select=id,title,topic,style,brand_id`);
+    const vr = await sb('GET', `videos?id=eq.${encodeURIComponent(video_id)}&select=id,title,topic,style,brand_id,final_asset`);
     const v = (vr || [])[0];
     if (!v) return res.status(404).json({ error: 'video not found' });
 
     const dir = (userPrompt || '').trim();   // optional creative direction (by description)
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'thumb-'));
+    const assetUrl = (p) => /^https?:/.test(p) ? p : `${SB_URL}/storage/v1/object/public/assets/${p}`;
+    const partFromBytes = (buf, mime) => ({ inlineData: { mimeType: mime, data: Buffer.from(buf).toString('base64') } });
 
-    // optional reference image (by example): fetch once, pass into every generation
+    // BRAND: real logo + palette (so the thumbnail is on-brand, not generic clipart)
+    let logoPart = null, accent = '#F6BB54', navy = '#12202E', brandName = '';
+    try {
+      if (v.brand_id) {
+        const br = (await sb('GET', `brands?id=eq.${encodeURIComponent(v.brand_id)}&select=name,palette,logo_asset`))[0];
+        if (br) {
+          brandName = br.name || '';
+          const pal = br.palette || {}; accent = pal.accent || accent; navy = pal.navy || navy;
+          if (br.logo_asset) {
+            const la = (await sb('GET', `assets?id=eq.${encodeURIComponent(br.logo_asset)}&select=storage_path`))[0];
+            if (la) { const lr = await fetch(assetUrl(la.storage_path)); if (lr.ok) logoPart = partFromBytes(await lr.arrayBuffer(), lr.headers.get('content-type') || 'image/png'); }
+          }
+        }
+      }
+    } catch { /* brand is best-effort */ }
+
+    // PRODUCT FRAME: pull a real frame from the finished video so the thumbnail
+    // shows the actual product (like the auto-generated one), not stock art
+    let framePart = null;
+    try {
+      if (v.final_asset) {
+        const fa = (await sb('GET', `assets?id=eq.${encodeURIComponent(v.final_asset)}&select=storage_path`))[0];
+        if (fa) {
+          const mp4 = path.join(tmp, 'v.mp4'); const fr = path.join(tmp, 'frame.jpg');
+          const mr = await fetch(assetUrl(fa.storage_path));
+          if (mr.ok) {
+            fs.writeFileSync(mp4, Buffer.from(await mr.arrayBuffer()));
+            let d = 20; try { d = Number(execFileSync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', mp4]).toString().trim()) || 20; } catch {}
+            execFileSync('ffmpeg', ['-nostdin', '-y', '-ss', String(Math.max(3, d * 0.45)), '-i', mp4, '-frames:v', '1', '-q:v', '3', fr], { stdio: 'ignore' });
+            if (fs.existsSync(fr)) framePart = partFromBytes(fs.readFileSync(fr), 'image/jpeg');
+          }
+        }
+      }
+    } catch { /* frame is best-effort */ }
+
+    // optional reference image (by example)
     let refPart = null;
     if (example) {
-      try {
-        const refUrl = /^https?:/.test(example) ? example : `${SB_URL}/storage/v1/object/public/assets/${example}`;
-        const rr = await fetch(refUrl);
-        if (rr.ok) refPart = { inlineData: { mimeType: rr.headers.get('content-type') || 'image/png',
-          data: Buffer.from(await rr.arrayBuffer()).toString('base64') } };
-      } catch { /* reference is optional */ }
+      try { const rr = await fetch(assetUrl(example)); if (rr.ok) refPart = partFromBytes(await rr.arrayBuffer(), rr.headers.get('content-type') || 'image/png'); } catch { /* optional */ }
     }
 
+    // punchy headlines from the video's own content
     let ideas = [];
     try {
       const out = await aiJSON(
-        `Design YouTube thumbnails for this video.\nTitle: ${v.title}\nTopic: ${v.topic || ''}\n`
-        + (dir ? `Creative direction from the user (follow it closely): ${dir}\n` : '')
-        + `Give ${count || 3} distinct concepts. Each needs a punchy 2-4 WORD headline (it will be drawn `
-        + `large on the thumbnail) and a one-sentence visual description that suits a `
-        + `${v.style === 'kids' ? 'bright playful cartoon for children' : 'clean flat-2D explainer'}.\n`
-        + 'Return ONLY JSON: {"ideas":[{"headline":"...","visual":"..."}]}', 900);
+        `Punchy YouTube thumbnail headlines for this video.\nTitle: ${v.title}\nTopic: ${v.topic || ''}\n`
+        + (dir ? `Creative direction from the user: ${dir}\n` : '')
+        + `Give ${count || 3} distinct options. Each headline is 2-4 WORDS, bold and benefit-driven (drawn large on the thumbnail).\n`
+        + 'Return ONLY JSON: {"ideas":[{"headline":"..."}]}', 700);
       ideas = out.ideas || [];
     } catch { /* fall back below */ }
-    if (!ideas.length) ideas = [{ headline: (v.title || 'Watch this').split(' ').slice(0, 3).join(' '), visual: dir || v.topic || v.title }];
-
-    const look = v.style === 'kids'
-      ? "Bright friendly flat-2D cartoon for a children's channel, bold rounded shapes, cheerful palette"
-      : 'Clean flat-2D vector explainer illustration, warm flat colours, simple geometric shapes';
+    if (!ideas.length) ideas = [{ headline: (v.title || 'Watch this').split(' ').slice(0, 3).join(' ') }];
 
     const made = [];
     for (const idea of ideas.slice(0, count || 3)) {
-      const prompt = `YouTube thumbnail, 16:9, extremely eye-catching and readable at small size. ${look}. `
-        + `Scene: ${idea.visual}. ${dir ? `Creative direction: ${dir}. ` : ''}`
-        + `${refPart ? 'Use the supplied reference image as strong inspiration for composition, colour and overall style. ' : ''}`
-        + `Leave a clear area for a short headline. High contrast, bold, uncluttered. `
-        + `Do not render any text, letters or numbers in the image.`;
+      // premium, on-brand composition (logo + real product frame + brand palette)
+      let prompt = `Design a premium, high-converting 16:9 YouTube thumbnail${brandName ? ` for ${brandName}` : ''}. `
+        + `Deep navy background (${navy}) with a subtle darker gradient and a warm ${accent} accent. `
+        + (logoPart ? `Reference image 1 is the brand LOGO — place it cleanly in the TOP-LEFT, removing any white background box so it sits directly on the navy, crisp and legible. ` : '')
+        + (framePart ? `The product screenshot reference — present it inside a sleek modern browser window with rounded corners and a soft drop shadow, angled slightly in 3D, on the right ~55% of the frame. ` : '')
+        + `On the LEFT, a bold punchy headline in large heavy white sans-serif, up to two lines: "${idea.headline}". `
+        + `Below it a small rounded ${accent} pill with dark navy text reading "${(brandName || 'Watch').slice(0, 22)} in action". `
+        + `Add subtle upward growth motifs in ${accent} (a faint rising line-graph and a few small sparkles). `
+        + `Clean, high-contrast, trustworthy and professional; readable at small sizes. Do not add any other logos, captions or watermarks.`;
+      if (dir) prompt += `\n\nADDITIONAL DIRECTION (follow closely, overrides defaults but keep OUR logo and product): ${dir}`;
+      if (refPart) prompt += `\n\nThe last reference image is an EXAMPLE thumbnail — match its overall STYLE, LAYOUT and colour feel while using OUR logo and product.`;
+      const parts = [{ text: prompt }];
+      if (logoPart) parts.push(logoPart);
+      if (framePart) parts.push(framePart);
+      if (refPart) parts.push(refPart);
       try {
-        const parts = refPart ? [refPart, { text: prompt }] : [{ text: prompt }];
         const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-image:generateContent?key=${gem}`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ contents: [{ parts }], generationConfig: { responseModalities: ['IMAGE'] } }),
