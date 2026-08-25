@@ -863,13 +863,13 @@ app.post('/api/thumbnails', async (req, res) => {
       // premium, on-brand composition matching the LIGHT website theme
       // (white background, violet accent, navy text)
       let prompt = `Design a premium, high-converting 16:9 YouTube thumbnail${brandName ? ` for ${brandName}` : ''} that matches a bright modern SaaS website. `
-        + `Clean WHITE background (#ffffff) with a subtle soft light-violet glow — NOT dark. Violet accent (${accent}). `
-        + (logoPart ? `Reference image 1 is the brand LOGO — place it cleanly in the TOP-LEFT, crisp and legible on the white. ` : '')
+        + `Mostly-white background with a SUBTLE, SOFT PINK-to-lavender GRADIENT glow (gentle blush pink fading into white, with a faint hint of violet ${accent}) — light and airy, NOT dark, and keep the gradient understated. `
+        + (logoPart ? `Reference image 1 is the brand LOGO — place it cleanly in the TOP-LEFT, crisp and legible. ` : '')
         + (framePart ? `The product screenshot reference — present it inside a sleek modern browser window with rounded corners and a soft drop shadow, angled slightly in 3D, on the right ~55% of the frame. ` : '')
         + `On the LEFT, a bold punchy headline in large heavy DARK NAVY (${navy}) sans-serif, up to two lines: "${idea.headline}". `
         + `Below it a small rounded solid violet (${accent}) pill with WHITE text reading "${(brandName || 'Watch').slice(0, 22)} in action". `
-        + `Add subtle upward growth motifs in ${accent}. `
-        + `Clean, light, airy, trustworthy and professional; high-contrast and readable at small sizes. Do not add any other logos, captions or watermarks.`;
+        + `Clean, minimal and uncluttered — NO arrows, graphs, charts or growth motifs. `
+        + `Light, airy, trustworthy and professional; high-contrast and readable at small sizes. Do not add any other logos, captions or watermarks.`;
       if (dir) prompt += `\n\nADDITIONAL DIRECTION (follow closely, overrides defaults but keep OUR logo and product): ${dir}`;
       if (refPart) prompt += `\n\nThe last reference image is an EXAMPLE thumbnail — match its overall STYLE, LAYOUT and colour feel while using OUR logo and product.`;
       const parts = [{ text: prompt }];
