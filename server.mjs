@@ -791,7 +791,7 @@ Return ONLY JSON: {"title":"...","brief":"..."}`, 1200);
 app.post('/api/thumbnails', async (req, res) => {
   if (!authed(req)) return res.status(401).json({ error: 'unauth' });
   try {
-    const { video_id, count, prompt: userPrompt, example } = req.body || {};
+    const { video_id, count, prompt: userPrompt, example, headline: userHeadline } = req.body || {};
     if (!video_id) return res.status(400).json({ error: 'video_id required' });
     const gem = process.env.GEMINI_API_KEY;
     if (!gem) return res.status(500).json({ error: 'image generation is not configured' });
@@ -849,15 +849,21 @@ app.post('/api/thumbnails', async (req, res) => {
 
     // punchy headlines from the video's own content
     let ideas = [];
-    try {
-      const out = await aiJSON(
-        `Punchy YouTube thumbnail headlines for this video.\nTitle: ${v.title}\nTopic: ${v.topic || ''}\n`
-        + (dir ? `Creative direction from the user: ${dir}\n` : '')
-        + `Give ${count || 3} distinct options. Each headline is 2-4 WORDS, bold and benefit-driven (drawn large on the thumbnail).\n`
-        + 'Return ONLY JSON: {"ideas":[{"headline":"..."}]}', 700);
-      ideas = out.ideas || [];
-    } catch { /* fall back below */ }
-    if (!ideas.length) ideas = [{ headline: (v.title || 'Watch this').split(' ').slice(0, 3).join(' ') }];
+    const hl = (userHeadline || '').trim();
+    if (hl) {
+      // user supplied the exact headline -> use it verbatim on every option
+      ideas = Array.from({ length: count || 3 }, () => ({ headline: hl }));
+    } else {
+      try {
+        const out = await aiJSON(
+          `Punchy YouTube thumbnail headlines for this video.\nTitle: ${v.title}\nTopic: ${v.topic || ''}\n`
+          + (dir ? `Creative direction from the user: ${dir}\n` : '')
+          + `Give ${count || 3} distinct options. Each headline is 2-4 WORDS, bold and benefit-driven (drawn large on the thumbnail).\n`
+          + 'Return ONLY JSON: {"ideas":[{"headline":"..."}]}', 700);
+        ideas = out.ideas || [];
+      } catch { /* fall back below */ }
+      if (!ideas.length) ideas = [{ headline: (v.title || 'Watch this').split(' ').slice(0, 3).join(' ') }];
+    }
 
     const made = [];
     for (const idea of ideas.slice(0, count || 3)) {
