@@ -807,12 +807,13 @@ app.post('/api/thumbnails', async (req, res) => {
 
     // BRAND: real logo + palette (so the thumbnail is on-brand, not generic clipart)
     let logoPart = null, accent = '#F6BB54', navy = '#12202E', brandName = '';
+    let brandStyle = null;   // per-brand thumbnail look (from brand.palette.thumb_style)
     try {
       if (v.brand_id) {
         const br = (await sb('GET', `brands?id=eq.${encodeURIComponent(v.brand_id)}&select=name,palette,logo_asset`))[0];
         if (br) {
           brandName = br.name || '';
-          const pal = br.palette || {}; accent = pal.accent || accent; navy = pal.navy || navy;
+          const pal = br.palette || {}; accent = pal.accent || accent; navy = pal.navy || navy; brandStyle = pal.thumb_style || brandStyle;
           if (br.logo_asset) {
             const la = (await sb('GET', `assets?id=eq.${encodeURIComponent(br.logo_asset)}&select=storage_path`))[0];
             if (la) { const lr = await fetch(assetUrl(la.storage_path)); if (lr.ok) logoPart = partFromBytes(await lr.arrayBuffer(), lr.headers.get('content-type') || 'image/png'); }
@@ -862,14 +863,15 @@ app.post('/api/thumbnails', async (req, res) => {
     for (const idea of ideas.slice(0, count || 3)) {
       // premium, on-brand composition matching the LIGHT website theme
       // (white background, violet accent, navy text)
-      let prompt = `Design a premium, high-converting 16:9 YouTube thumbnail${brandName ? ` for ${brandName}` : ''} that matches a bright modern SaaS website. `
-        + `Mostly-white background with a SUBTLE, SOFT PINK-to-lavender GRADIENT glow (gentle blush pink fading into white, with a faint hint of violet ${accent}) — light and airy, NOT dark, and keep the gradient understated. `
+      const styleLine = brandStyle
+        || `Clean, professional background in the brand's colours (accent ${accent}); light and uncluttered. No arrows, graphs or charts.`;
+      let prompt = `Design a premium, high-converting 16:9 YouTube thumbnail${brandName ? ` for ${brandName}` : ''}. `
+        + `${styleLine} `
         + (logoPart ? `Reference image 1 is the brand LOGO — place it cleanly in the TOP-LEFT, crisp and legible. ` : '')
         + (framePart ? `The product screenshot reference — present it inside a sleek modern browser window with rounded corners and a soft drop shadow, angled slightly in 3D, on the right ~55% of the frame. ` : '')
-        + `On the LEFT, a bold punchy headline in large heavy DARK NAVY (${navy}) sans-serif, up to two lines: "${idea.headline}". `
-        + `Below it a small rounded solid violet (${accent}) pill with WHITE text reading "${(brandName || 'Watch').slice(0, 22)} in action". `
-        + `Clean, minimal and uncluttered — NO arrows, graphs, charts or growth motifs. `
-        + `Light, airy, trustworthy and professional; high-contrast and readable at small sizes. Do not add any other logos, captions or watermarks.`;
+        + `On the LEFT, a bold punchy headline in large heavy ${navy} sans-serif, up to two lines: "${idea.headline}". `
+        + `Below it a small rounded solid ${accent} pill with WHITE text reading "${(brandName || 'Watch').slice(0, 22)} in action". `
+        + `Crisp and readable at small sizes. Do not add any other logos, captions or watermarks.`;
       if (dir) prompt += `\n\nADDITIONAL DIRECTION (follow closely, overrides defaults but keep OUR logo and product): ${dir}`;
       if (refPart) prompt += `\n\nThe last reference image is an EXAMPLE thumbnail — match its overall STYLE, LAYOUT and colour feel while using OUR logo and product.`;
       const parts = [{ text: prompt }];
