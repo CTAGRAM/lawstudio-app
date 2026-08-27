@@ -1445,7 +1445,8 @@ app.post('/api/screencast/sign', async (req, res) => {
 app.post('/api/screencast/create', async (req, res) => {
   if (!authed(req)) return res.status(401).json({ error: 'unauth' });
   try {
-    const { path, title, topic, brand_id, thumbPrompt, thumbExample, aspectPack } = req.body || {};
+    const { path, title, topic, brand_id, thumbPrompt, thumbExample, aspectPack,
+            motion, branding, subtitles } = req.body || {};
     if (!path) return res.status(400).json({ error: 'no uploaded file path' });
     if (!brand_id) return res.status(400).json({ error: 'pick a brand first' });
     const a = await sb('POST', 'assets', { kind: 'clip', title: title || 'screen recording',
@@ -1454,7 +1455,8 @@ app.post('/api/screencast/create', async (req, res) => {
     const v = await sb('POST', 'videos', { title: title || 'Screen recording', topic: topic || null,
       style: 'screencast', kind: 'screencast', brand_id, status: 'queued',
       progress: { via: 'upload', source: path, source_asset: asset.id, goal: topic || '',
-        aspectPack: !!aspectPack, thumbPrompt: thumbPrompt || null, thumbExample: thumbExample || null } });
+        aspectPack: !!aspectPack, thumbPrompt: thumbPrompt || null, thumbExample: thumbExample || null,
+        motion: motion !== false, branding: branding !== false, subtitles: subtitles !== false } });
     const video = Array.isArray(v) ? v[0] : v;
     res.json({ video_id: video.id });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
@@ -1468,7 +1470,8 @@ app.post('/api/screencast/create', async (req, res) => {
 app.post('/api/browsercast', async (req, res) => {
   if (!authed(req)) return res.status(401).json({ error: 'unauth' });
   try {
-    const { url, goal, title, brand_id, thumbPrompt, thumbExample, aspectPack } = req.body || {};
+    const { url, goal, title, brand_id, thumbPrompt, thumbExample, aspectPack,
+            motion, branding, subtitles, loginUser, loginPass } = req.body || {};
     if (!url) return res.status(400).json({ error: 'url required' });
     if (!brand_id) return res.status(400).json({ error: 'pick a brand first' });
     let host; try { host = new URL(url).host.replace(/^www\./, ''); }
@@ -1477,9 +1480,17 @@ app.post('/api/browsercast', async (req, res) => {
       title: title || `${host} — walkthrough`, topic: url,
       style: 'screencast', kind: 'screencast', brand_id, status: 'queued',
       progress: { via: 'browsercast', url, goal: goal || '', aspectPack: !!aspectPack,
-        thumbPrompt: thumbPrompt || null, thumbExample: thumbExample || null } });
-    const video = Array.isArray(v) ? v[0] : v;
-    res.json({ video_id: video.id });
+        thumbPrompt: thumbPrompt || null, thumbExample: thumbExample || null,
+        motion: motion !== false, branding: branding !== false, subtitles: subtitles !== false,
+        // creds are never written to the anon-readable videos row; stored server-side below
+        login: (loginUser && loginPass) ? true : false } });
+    const video0 = Array.isArray(v) ? v[0] : v;
+    // login credentials → separate table, service-role/RLS-locked, keyed by video id
+    if (loginUser && loginPass) {
+      try { await sb('POST', 'browsercast_creds', { video_id: video0.id, username: loginUser, password: loginPass }); }
+      catch (e) { console.error('cred store failed', e.message); }
+    }
+    res.json({ video_id: video0.id });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
