@@ -1446,7 +1446,7 @@ app.post('/api/screencast/create', async (req, res) => {
   if (!authed(req)) return res.status(401).json({ error: 'unauth' });
   try {
     const { path, title, topic, brand_id, thumbPrompt, thumbExample, aspectPack,
-            motion, branding, subtitles } = req.body || {};
+            motion, branding, subtitles, explainerStyle } = req.body || {};
     if (!path) return res.status(400).json({ error: 'no uploaded file path' });
     if (!brand_id) return res.status(400).json({ error: 'pick a brand first' });
     const a = await sb('POST', 'assets', { kind: 'clip', title: title || 'screen recording',
@@ -1456,7 +1456,8 @@ app.post('/api/screencast/create', async (req, res) => {
       style: 'screencast', kind: 'screencast', brand_id, status: 'queued',
       progress: { via: 'upload', source: path, source_asset: asset.id, goal: topic || '',
         aspectPack: !!aspectPack, thumbPrompt: thumbPrompt || null, thumbExample: thumbExample || null,
-        motion: motion !== false, branding: branding !== false, subtitles: subtitles !== false } });
+        motion: motion !== false, branding: branding !== false, subtitles: subtitles !== false,
+        explainerStyle: explainerStyle === 'polished' ? 'polished' : null } });
     const video = Array.isArray(v) ? v[0] : v;
     res.json({ video_id: video.id });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
